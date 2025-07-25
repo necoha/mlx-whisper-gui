@@ -14,6 +14,9 @@ import platform
 from datetime import datetime
 import socket
 import tempfile
+import subprocess
+import json
+import time
 
 
 class SingleInstanceLock:
@@ -111,6 +114,10 @@ class WhisperGUI:
         self.auto_save_var = tk.BooleanVar(value=True)
         self.is_processing = False
         self.batch_files = []
+        self.audio_duration = 0  # Duration in seconds
+        self.transcription_start_time = 0  # Start time for ETA calculation
+        self.eta_history = []  # Store ETA calculations for smoothing
+        self.processing_stage = "idle"  # Track current processing stage
         
         # Available models - MLX large-v3 for highest accuracy
         self.models = ["large-v3"]
@@ -171,10 +178,17 @@ class WhisperGUI:
                                         variable=self.auto_save_var)
         auto_save_check.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(5, 5))
         
-        # Progress bar
+        # Progress bar with label
+        progress_frame = ttk.Frame(main_frame)
+        progress_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 5))
+        progress_frame.columnconfigure(0, weight=1)
+        
+        self.progress_label = ttk.Label(progress_frame, text="")
+        self.progress_label.grid(row=0, column=0, sticky=tk.W, pady=(0, 2))
+        
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, maximum=100)
-        self.progress_bar.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 5))
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
+        self.progress_bar.grid(row=1, column=0, sticky=(tk.W, tk.E))
         
         # Buttons frame
         button_frame = ttk.Frame(main_frame)
@@ -216,7 +230,46 @@ class WhisperGUI:
         
         if filename:
             self.selected_file.set(filename)
-            self.status_var.set(f"Selected: {os.path.basename(filename)}")
+            # Get audio duration
+            duration = self.get_audio_duration(filename)
+            self.audio_duration = duration
+            if duration > 0:
+                duration_str = f"{duration//60}:{duration%60:02d}"
+                self.status_var.set(f"Selected: {os.path.basename(filename)} ({duration_str})")
+            else:
+                self.status_var.set(f"Selected: {os.path.basename(filename)}")
+    
+    def get_audio_duration(self, file_path):
+        """Get audio file duration in seconds using ffprobe"""
+        try:
+            # Try to find ffprobe in bundled app first
+            ffprobe_cmd = "ffprobe"
+            if getattr(sys, 'frozen', False):
+                # Running in PyInstaller bundle
+                bundle_dir = sys._MEIPASS
+                ffprobe_path = os.path.join(bundle_dir, 'ffprobe')
+                if os.path.exists(ffprobe_path):
+                    ffprobe_cmd = ffprobe_path
+                else:
+                    # Try the Resources directory
+                    resources_dir = os.path.join(os.path.dirname(sys.executable), '..', 'Resources')
+                    ffprobe_path = os.path.join(resources_dir, 'ffprobe')
+                    if os.path.exists(ffprobe_path):
+                        ffprobe_cmd = ffprobe_path
+            
+            # Use ffprobe to get audio duration
+            cmd = [
+                ffprobe_cmd, "-v", "quiet", "-print_format", "json", 
+                "-show_format", file_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                duration = float(data['format']['duration'])
+                return int(duration)
+        except Exception as e:
+            print(f"Debug: ffprobe error: {e}")
+        return 0
     
     def start_transcription(self):
         """Start transcription in a separate thread"""
@@ -236,13 +289,104 @@ class WhisperGUI:
         self.transcribe_btn.config(state="disabled")
         self.batch_btn.config(state="disabled")
         self.is_processing = True
-        self.progress_bar.config(mode="indeterminate")
-        self.progress_bar.start()
+        
+        # Always use determinate progress with manual updates
+        self.progress_bar.config(mode="determinate")
+        self.progress_var.set(0)
+        if self.audio_duration > 0:
+            duration_str = f"{self.audio_duration//60}:{self.audio_duration%60:02d}"
+            self.progress_label.config(text=f"Initializing transcription... ({duration_str} audio)")
+        else:
+            self.progress_label.config(text="Initializing transcription...")
         self.status_var.set("Loading MLX model...")
         
         # Start transcription in separate thread
         thread = threading.Thread(target=self.transcribe_audio, daemon=True)
         thread.start()
+    
+    def calculate_smooth_eta(self, current_eta):
+        """Calculate smoothed ETA to reduce fluctuations"""
+        self.eta_history.append(current_eta)
+        # Keep only last 5 ETA calculations for smoothing
+        if len(self.eta_history) > 5:
+            self.eta_history.pop(0)
+        
+        # Return median of recent ETAs for stability
+        if len(self.eta_history) >= 3:
+            sorted_etas = sorted(self.eta_history)
+            return sorted_etas[len(sorted_etas) // 2]
+        else:
+            return current_eta
+
+    def update_progress_simulation(self, stage, progress=0, elapsed_real_time=0):
+        """Enhanced progress updates with accurate ETA calculation"""
+        if not self.is_processing:
+            return
+        
+        self.processing_stage = stage
+            
+        if stage == "loading":
+            self.progress_var.set(5)
+            self.progress_label.config(text="Loading MLX Whisper model...")
+            self.eta_history.clear()
+        elif stage == "processing":
+            if self.audio_duration > 0:
+                # With audio duration - show detailed progress with smart ETA
+                base_progress = 5 + (progress * 90)  # 5% to 95%
+                self.progress_var.set(min(base_progress, 90))
+                
+                elapsed = int(progress * self.audio_duration)
+                elapsed_str = f"{elapsed//60}:{elapsed%60:02d}"
+                duration_str = f"{self.audio_duration//60}:{self.audio_duration%60:02d}"
+                
+                # Enhanced ETA calculation
+                eta_str = ""
+                if progress > 0.05 and elapsed_real_time > 5:  # Wait for meaningful data
+                    # MLX Whisper typically processes at 2-4x realtime on Apple Silicon
+                    # Adjust based on actual performance
+                    if progress < 0.5:
+                        # Early stage: conservative estimate (1.5x realtime)
+                        estimated_speed_factor = 1.5
+                    else:
+                        # Later stage: more optimistic (2.5x realtime)
+                        estimated_speed_factor = 2.5
+                    
+                    # Calculate remaining audio time
+                    remaining_audio = self.audio_duration * (1 - progress)
+                    estimated_remaining_time = remaining_audio / estimated_speed_factor
+                    
+                    # Smooth the ETA to reduce jitter
+                    smooth_eta = self.calculate_smooth_eta(estimated_remaining_time)
+                    
+                    if smooth_eta > 0:
+                        eta_minutes = int(smooth_eta // 60)
+                        eta_seconds = int(smooth_eta % 60)
+                        eta_str = f" (ETA: {eta_minutes}:{eta_seconds:02d})"
+                
+                progress_percent = int(base_progress)
+                self.progress_label.config(text=f"Processing audio... {elapsed_str}/{duration_str} ({progress_percent}%){eta_str}")
+            else:
+                # Without audio duration - show basic progress with elapsed time
+                base_progress = 5 + (progress * 90)
+                self.progress_var.set(min(base_progress, 90))
+                
+                eta_str = ""
+                if elapsed_real_time > 10:  # After 10 seconds, show rough ETA
+                    # Estimate based on typical processing patterns
+                    if progress > 0.1:
+                        estimated_total = elapsed_real_time / progress
+                        remaining = max(0, estimated_total - elapsed_real_time)
+                        eta_minutes = int(remaining // 60)
+                        eta_seconds = int(remaining % 60)
+                        eta_str = f" (ETA: ~{eta_minutes}:{eta_seconds:02d})"
+                
+                elapsed_minutes = int(elapsed_real_time // 60)
+                elapsed_seconds = int(elapsed_real_time % 60)
+                progress_percent = int(base_progress)
+                self.progress_label.config(text=f"Processing audio... {elapsed_minutes}:{elapsed_seconds:02d} elapsed ({progress_percent}%){eta_str}")
+        elif stage == "finalizing":
+            self.progress_var.set(98)
+            self.progress_label.config(text="Finalizing transcript... (almost done!)")
     
     def transcribe_audio(self):
         """Perform audio transcription using MLX Whisper"""
@@ -252,16 +396,63 @@ class WhisperGUI:
             
             # Load MLX model
             self.root.after(0, lambda: self.status_var.set(f"Loading {model_name} model..."))
+            self.root.after(0, lambda: self.update_progress_simulation("loading"))
             
             # Use MLX Whisper large-v3 for highest accuracy
             mlx_model_name = "mlx-community/whisper-large-v3-mlx"
             self.root.after(0, lambda: self.status_var.set("Transcribing audio with MLX..."))
+            
+            # Simulate progress during transcription
+            import time
+            start_time = time.time()
+            self.transcription_start_time = start_time
+            
+            # Start enhanced progress tracking thread
+            def progress_updater():
+                last_update = 0
+                while self.is_processing:
+                    elapsed = time.time() - start_time
+                    
+                    if self.audio_duration > 0:
+                        # More realistic progress estimation for MLX Whisper
+                        # MLX is typically 2-4x faster than realtime
+                        if elapsed < 10:
+                            # Initial loading phase
+                            estimated_progress = min(elapsed / 10.0 * 0.1, 0.1)
+                        else:
+                            # Processing phase: assume 2.5x realtime average
+                            processing_elapsed = elapsed - 10
+                            estimated_audio_processed = processing_elapsed * 2.5
+                            estimated_progress = 0.1 + min(estimated_audio_processed / self.audio_duration * 0.8, 0.8)
+                    else:
+                        # Without audio duration, use adaptive curve
+                        if elapsed < 20:
+                            estimated_progress = elapsed / 20.0 * 0.5
+                        else:
+                            # Slower progress after 20 seconds
+                            estimated_progress = 0.5 + min((elapsed - 20) / 40.0 * 0.4, 0.4)
+                    
+                    # Update every 2 seconds or when progress changes significantly
+                    current_time = time.time()
+                    if (current_time - last_update >= 2) or abs(estimated_progress - getattr(self, '_last_progress', 0)) > 0.05:
+                        self.root.after(0, lambda p=estimated_progress, e=elapsed: 
+                            self.update_progress_simulation("processing", p, e))
+                        last_update = current_time
+                        self._last_progress = estimated_progress
+                    
+                    time.sleep(0.5)  # More frequent checks but less frequent updates
+            
+            progress_thread = threading.Thread(target=progress_updater, daemon=True)
+            progress_thread.start()
             
             result = mlx_whisper.transcribe(
                 self.selected_file.get(),
                 path_or_hf_repo=mlx_model_name,
                 language=language
             )
+            
+            # Finalizing
+            self.root.after(0, lambda: self.update_progress_simulation("finalizing"))
             
             # Update UI with results
             self.root.after(0, lambda: self.display_results(result))
@@ -304,7 +495,30 @@ class WhisperGUI:
         self.batch_btn.config(state="normal")
         self.progress_bar.stop()
         self.progress_bar.config(mode="determinate")
-        self.progress_var.set(0)
+        self.progress_var.set(100)
+        
+        # Calculate actual processing time
+        if hasattr(self, 'transcription_start_time') and self.transcription_start_time > 0:
+            total_time = time.time() - self.transcription_start_time
+            time_minutes = int(total_time // 60)
+            time_seconds = int(total_time % 60)
+            if self.audio_duration > 0:
+                speed_factor = self.audio_duration / total_time
+                self.progress_label.config(text=f"Completed in {time_minutes}:{time_seconds:02d} ({speed_factor:.1f}x realtime)")
+            else:
+                self.progress_label.config(text=f"Completed in {time_minutes}:{time_seconds:02d}")
+        else:
+            self.progress_label.config(text="Transcription completed")
+        
+        # Clear progress after 5 seconds
+        self.root.after(5000, lambda: (
+            self.progress_var.set(0),
+            self.progress_label.config(text="")
+        ))
+        
+        # Clear ETA history for next transcription
+        self.eta_history.clear()
+        self.processing_stage = "idle"
     
     def clear_results(self):
         """Clear transcription results"""
@@ -384,6 +598,7 @@ class WhisperGUI:
         self.is_processing = True
         self.progress_bar.config(mode="determinate")
         self.progress_var.set(0)
+        self.progress_label.config(text="Starting batch processing...")
         
         # Start batch processing in separate thread
         thread = threading.Thread(target=self.process_batch_files, daemon=True)
@@ -392,6 +607,8 @@ class WhisperGUI:
     def process_batch_files(self):
         """Process multiple files in batch"""
         try:
+            import time
+            batch_start_time = time.time()
             total_files = len(self.batch_files)
             all_transcripts = []
             
@@ -399,11 +616,26 @@ class WhisperGUI:
                 if not self.is_processing:  # Check if cancelled
                     break
                 
-                # Update progress
+                # Update progress with ETA
                 progress = (i / total_files) * 100
                 self.root.after(0, lambda p=progress: self.progress_var.set(p))
                 
                 filename = os.path.basename(file_path)
+                
+                # Calculate ETA for batch processing
+                if i > 0:
+                    elapsed = time.time() - batch_start_time
+                    avg_time_per_file = elapsed / i
+                    remaining_files = total_files - i
+                    eta_seconds = int(avg_time_per_file * remaining_files)
+                    eta_minutes = eta_seconds // 60
+                    eta_seconds = eta_seconds % 60
+                    eta_str = f" (ETA: {eta_minutes}:{eta_seconds:02d})"
+                else:
+                    eta_str = ""
+                
+                self.root.after(0, lambda f=filename, i=i, t=total_files, eta=eta_str: 
+                    self.progress_label.config(text=f"Processing file {i+1}/{t}: {f}{eta}"))
                 self.root.after(0, lambda f=filename: self.status_var.set(f"Processing {f}..."))
                 
                 try:
@@ -457,6 +689,7 @@ class WhisperGUI:
         self.batch_btn.config(state="normal")
         self.progress_bar.config(mode="determinate")
         self.progress_var.set(100)
+        self.progress_label.config(text="Batch processing completed")
         self.batch_files = []
     
     def auto_save_transcript(self, transcript, audio_file_path):

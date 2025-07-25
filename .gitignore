@@ -1,0 +1,47 @@
+# Build outputs
+build/
+dist/
+*.dmg
+*.app
+
+# PyInstaller
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.DocumentRevisions-V100
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+__MACOSX/
+
+# Claude
+.claude/
+
+# FFmpeg binaries (large files)
+ffmpeg
+ffmpeg-static.zip
+
+# Temporary files
+*.tmp
+*.log
+transcript_*.py

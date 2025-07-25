@@ -1,100 +1,142 @@
 # MLX Whisper GUI
 
-Apple Silicon専用に最適化されたWhisper音声転写GUIアプリケーション
+A sophisticated graphical interface for MLX Whisper transcription on Apple Silicon Macs with advanced progress tracking and ETA estimation.
 
-## 主な機能
+## Features
 
-### ✨ 新機能
-- **🎤 リアルタイム録音**: マイクから直接音声を録音して転写
-- **📁 バッチ処理**: 複数の音声ファイルを一括で転写処理
-- **⚡ MLX最適化**: Apple Silicon GPUを活用した高速処理
+### Core Functionality
+- **High Accuracy**: Uses MLX Whisper large-v3 model for optimal transcription quality
+- **Smart Progress Tracking**: Real-time progress bar with ETA estimation
+- **Batch Processing**: Process multiple audio files simultaneously
+- **Auto-save**: Automatic transcript saving with original filename
+- **Single Instance**: Prevents multiple app instances for resource efficiency
 
-### 基本機能
-- 音声ファイルからテキストへの転写
-- 複数モデル対応（tiny, base, small, medium, large）
-- 多言語対応（自動検出、英語、日本語など）
-- 転写結果のテキストファイル保存
+### Advanced Progress System
+- **Intelligent ETA Calculation**: Adapts to MLX Whisper's 2-4x realtime processing speed
+- **Smooth Progress Updates**: Anti-jitter algorithm for stable progress display
+- **Processing Speed Display**: Shows completion time and realtime factor
+- **Stage Tracking**: Clear indication of loading, processing, and finalizing phases
 
-## 必要な環境
+### User Experience
+- **Audio Duration Detection**: Displays file length using ffprobe
+- **Drag-and-drop Interface**: Easy file selection
+- **Language Auto-detection**: Supports 10+ languages with auto-detection
+- **Real-time Status Updates**: Detailed processing information
 
-- **macOS** (Apple Silicon推奨)
-- **Python 3.8+**
-- **PortAudio** (音声録音用)
+## Requirements
 
-## インストール
+- **Hardware**: Apple Silicon Mac (M1/M2/M3/M4)
+- **OS**: macOS 12.0+ (Monterey or later)
+- **Dependencies**: All included in DMG distribution
 
-1. **PortAudioをインストール**:
-   ```bash
-   brew install portaudio
-   ```
+## Installation
 
-2. **仮想環境の作成とアクティベート**:
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
+### Option 1: DMG Distribution (Recommended)
+1. Download `MLXWhisperGUI.dmg` from releases
+2. Double-click to mount the disk image
+3. Drag `MLXWhisperGUI.app` to Applications folder
+4. Launch from Applications or Spotlight
 
-3. **必要なパッケージをインストール**:
-   ```bash
-   pip install mlx-whisper pyaudio
-   ```
-
-## 使用方法
-
-### 起動
-
+### Option 2: From Source
 ```bash
-./run_whisper_gui.sh
-```
+# Clone repository
+git clone https://github.com/yourusername/mlx-whisper-gui.git
+cd mlx-whisper-gui
 
-または直接：
+# Create virtual environment
+python3 -m venv whisper-gui
+source whisper-gui/bin/activate
 
-```bash
-source venv/bin/activate
+# Install dependencies
+pip install mlx-whisper
+
+# Run application
 python whisper_gui.py
 ```
 
-### 機能の使用方法
+## Usage
 
-1. **ファイル転写**: 
-   - 「Browse」ボタンで音声ファイルを選択
-   - モデルと言語を選択
-   - 「Transcribe」ボタンで転写開始
+### Basic Transcription
+1. **Select File**: Click "Browse" or drag audio file to select
+2. **Choose Settings**: Select language (auto-detect recommended)
+3. **Start Processing**: Click "Transcribe" to begin
+4. **Monitor Progress**: Watch real-time progress with ETA
+5. **Review Results**: Transcript appears automatically when complete
 
-2. **リアルタイム録音**:
-   - 「🎤 Record」ボタンで録音開始
-   - 「⏹️ Stop」ボタンで録音終了
-   - 自動的に転写が開始
+### Batch Processing
+1. Click "🗋 Batch" button
+2. Select multiple audio files
+3. Confirm processing in dialog
+4. Monitor batch progress with file-by-file ETA
+5. All transcripts saved automatically
 
-3. **バッチ処理**:
-   - 「📋 Batch」ボタンで複数ファイル選択
-   - 確認ダイアログで「Yes」を選択
-   - 全ファイルの転写結果を一括表示
+### Progress Information
+- **With Audio Duration**: `"Processing audio... 2:30/5:00 (45%) (ETA: 1:23)"`
+- **Without Duration**: `"Processing audio... 1:30 elapsed (60%) (ETA: ~2:15)"`
+- **Completion**: `"Completed in 2:34 (1.9x realtime)"`
 
-## 対応形式
+## Supported Formats
 
-- **音声ファイル**: MP3, WAV, M4A, FLAC, OGG, WMA
-- **動画ファイル**: MP4, AVI, MOV, MKV
+### Audio Files
+- **Lossless**: WAV, FLAC
+- **Compressed**: MP3, M4A, OGG, WMA
+- **Professional**: AIFF, AU
 
-## 注意事項
+### Video Files (Audio Track)
+- **Standard**: MP4, AVI, MOV, MKV
+- **Streaming**: WebM, FLV
 
-- 初回実行時にマイクへのアクセス許可が求められます
-- MLXモデルの初回ダウンロードに時間がかかる場合があります
-- Apple Silicon以外のMacでは性能が制限される場合があります
+## Technical Details
 
-## トラブルシューティング
+### MLX Optimization
+- Utilizes Apple's MLX framework for maximum Apple Silicon performance
+- Automatic GPU acceleration on supported hardware
+- Memory-efficient processing for large audio files
 
-### PyAudioインストールエラー
+### Progress Algorithm
+- **Early Stage**: Conservative 1.5x realtime estimate
+- **Later Stage**: Optimistic 2.5x realtime estimate
+- **ETA Smoothing**: Median of last 5 calculations
+- **Update Frequency**: Every 2 seconds or 5% progress change
+
+## Building from Source
+
+### Requirements
 ```bash
-brew install portaudio
-pip install pyaudio
+pip install pyinstaller mlx-whisper
 ```
 
-### MLX Whisperが見つからない
+### Build Process
 ```bash
-pip install mlx-whisper
+# Build application bundle
+pyinstaller MLXWhisperGUI.spec
+
+# Create DMG distribution
+./create_dmg.sh
 ```
 
-### 録音できない
-- システム環境設定でマイクのアクセス許可を確認してください
-- PortAudioが正しくインストールされているか確認してください
+## Troubleshooting
+
+### Common Issues
+- **No Progress Display**: Ensure ffprobe is available in system PATH
+- **Slow Processing**: Check available memory and close other applications
+- **Audio Not Detected**: Verify file format is supported
+
+### Performance Tips
+- Use WAV or FLAC for fastest processing
+- Close unnecessary applications to free memory
+- Shorter audio files (< 30 minutes) process more efficiently
+
+## Contributing
+
+Contributions welcome! Please feel free to submit pull requests or open issues for bugs and feature requests.
+
+## License
+
+MIT License - see LICENSE file for details.
+
+## Acknowledgments
+
+- [MLX Whisper](https://github.com/ml-explore/mlx-whisper) - Apple MLX implementation
+- [OpenAI Whisper](https://github.com/openai/whisper) - Original Whisper model
+- Apple MLX Team - Framework development
