@@ -17,60 +17,203 @@ import tempfile
 import subprocess
 import json
 import time
+import fcntl
+import signal
+import atexit
 
 
 class SingleInstanceLock:
-    """Prevents multiple instances of the application from running"""
+    """Advanced single instance lock using multiple mechanisms"""
     def __init__(self, app_name="MLXWhisperGUI"):
         self.app_name = app_name
-        self.lock_file = None
+        self.lock_file_path = None
+        self.lock_file_handle = None
         self.socket = None
+        self.pid_file_path = None
         
     def acquire_lock(self):
-        """Try to acquire the single instance lock"""
+        """Try to acquire the single instance lock using multiple methods"""
         try:
-            # Try socket-based approach first
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.bind(('127.0.0.1', 0))  # Bind to any available port
-            port = self.socket.getsockname()[1]
+            # Method 1: File-based locking with fcntl (most reliable on Unix)
+            if self._try_file_lock():
+                # Method 2: Socket-based lock as backup
+                if self._try_socket_lock():
+                    # Method 3: PID-based verification
+                    if self._write_pid_file():
+                        # Register cleanup on exit
+                        atexit.register(self.release_lock)
+                        # Handle signals for clean shutdown
+                        signal.signal(signal.SIGTERM, self._signal_handler)
+                        signal.signal(signal.SIGINT, self._signal_handler)
+                        return True
             
-            # Store port in temp file for other instances to check
-            temp_dir = tempfile.gettempdir()
-            self.lock_file = os.path.join(temp_dir, f"{self.app_name}_port.lock")
+            return False
             
-            # Check if another instance is already running
-            if os.path.exists(self.lock_file):
-                with open(self.lock_file, 'r') as f:
+        except Exception as e:
+            print(f"Debug: Lock acquisition failed: {e}")
+            return False
+    
+    def _try_file_lock(self):
+        """Try to acquire exclusive file lock"""
+        try:
+            # Create lock directory if it doesn't exist
+            if platform.system() == "Darwin":
+                # Use ~/Library/Application Support on macOS
+                lock_dir = os.path.expanduser("~/Library/Application Support/MLXWhisperGUI")
+            else:
+                # Use system temp directory on other platforms
+                lock_dir = tempfile.gettempdir()
+            
+            os.makedirs(lock_dir, exist_ok=True)
+            self.lock_file_path = os.path.join(lock_dir, f"{self.app_name}.lock")
+            
+            # Open file for exclusive access
+            self.lock_file_handle = open(self.lock_file_path, 'w')
+            
+            # Try to acquire exclusive lock (non-blocking)
+            fcntl.flock(self.lock_file_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            
+            # Write current process info
+            self.lock_file_handle.write(f"{os.getpid()}\n{time.time()}\n{self.app_name}")
+            self.lock_file_handle.flush()
+            
+            return True
+            
+        except (IOError, OSError) as e:
+            # Lock is already held by another process
+            if self.lock_file_handle:
+                try:
+                    self.lock_file_handle.close()
+                except:
+                    pass
+                self.lock_file_handle = None
+            return False
+    
+    def _try_socket_lock(self):
+        """Try to acquire socket-based lock as secondary verification"""
+        try:
+            # Bind to a specific port range for this app
+            for port in range(17001, 17010):  # Use app-specific port range
+                try:
+                    self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    self.socket.bind(('127.0.0.1', port))
+                    self.socket.listen(1)
+                    return True
+                except OSError:
+                    if self.socket:
+                        self.socket.close()
+                        self.socket = None
+                    continue
+            
+            return False
+            
+        except Exception:
+            return False
+    
+    def _write_pid_file(self):
+        """Write PID file for additional verification"""
+        try:
+            if platform.system() == "Darwin":
+                pid_dir = os.path.expanduser("~/Library/Application Support/MLXWhisperGUI")
+            else:
+                pid_dir = tempfile.gettempdir()
+            
+            os.makedirs(pid_dir, exist_ok=True)
+            self.pid_file_path = os.path.join(pid_dir, f"{self.app_name}.pid")
+            
+            # Check if PID file exists and process is still running
+            if os.path.exists(self.pid_file_path):
+                try:
+                    with open(self.pid_file_path, 'r') as f:
+                        old_pid = int(f.read().strip())
+                    
+                    # Check if process is still running
                     try:
-                        existing_port = int(f.read().strip())
-                        # Test if the port is still in use
-                        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        test_socket.settimeout(1)
-                        result = test_socket.connect_ex(('127.0.0.1', existing_port))
-                        test_socket.close()
-                        if result == 0:
-                            return False  # Another instance is running
-                    except (ValueError, ConnectionRefusedError):
-                        pass  # Lock file is stale
+                        os.kill(old_pid, 0)  # Signal 0 just checks if process exists
+                        return False  # Process is still running
+                    except (OSError, ProcessLookupError):
+                        # Process is dead, remove stale PID file
+                        os.remove(self.pid_file_path)
+                except (ValueError, IOError):
+                    # Invalid PID file, remove it
+                    try:
+                        os.remove(self.pid_file_path)
+                    except:
+                        pass
             
-            # Write our port to the lock file
-            with open(self.lock_file, 'w') as f:
-                f.write(str(port))
+            # Write current PID
+            with open(self.pid_file_path, 'w') as f:
+                f.write(str(os.getpid()))
             
             return True
             
         except Exception:
             return False
     
+    def _signal_handler(self, signum, frame):
+        """Handle signals for clean shutdown"""
+        self.release_lock()
+        sys.exit(0)
+    
     def release_lock(self):
-        """Release the single instance lock"""
+        """Release all locks"""
         try:
+            # Release file lock
+            if self.lock_file_handle:
+                try:
+                    fcntl.flock(self.lock_file_handle.fileno(), fcntl.LOCK_UN)
+                    self.lock_file_handle.close()
+                except:
+                    pass
+                self.lock_file_handle = None
+            
+            # Remove lock file
+            if self.lock_file_path and os.path.exists(self.lock_file_path):
+                try:
+                    os.remove(self.lock_file_path)
+                except:
+                    pass
+            
+            # Release socket
             if self.socket:
-                self.socket.close()
-            if self.lock_file and os.path.exists(self.lock_file):
-                os.remove(self.lock_file)
-        except Exception:
-            pass
+                try:
+                    self.socket.close()
+                except:
+                    pass
+                self.socket = None
+            
+            # Remove PID file
+            if self.pid_file_path and os.path.exists(self.pid_file_path):
+                try:
+                    os.remove(self.pid_file_path)
+                except:
+                    pass
+                    
+        except Exception as e:
+            print(f"Debug: Lock release error: {e}")
+    
+    def is_another_instance_running(self):
+        """Check if another instance is already running"""
+        try:
+            # Quick check using socket
+            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_socket.settimeout(0.5)
+            
+            for port in range(17001, 17010):
+                try:
+                    result = test_socket.connect_ex(('127.0.0.1', port))
+                    if result == 0:
+                        test_socket.close()
+                        return True
+                except:
+                    continue
+            
+            test_socket.close()
+            return False
+            
+        except:
+            return False
 
 
 def setup_ffmpeg_path():
@@ -730,32 +873,126 @@ class WhisperGUI:
         self.instance_lock.release_lock()
         self.root.destroy()
     
+    def bring_to_front(self):
+        """Bring the application window to front"""
+        try:
+            self.root.lift()
+            self.root.attributes('-topmost', True)
+            self.root.after_idle(self.root.attributes, '-topmost', False)
+            self.root.focus_force()
+            
+            # Flash the dock icon on macOS
+            if platform.system() == "Darwin":
+                try:
+                    # Try to use osascript to bounce the dock icon
+                    subprocess.run(['osascript', '-e', 
+                        'tell application "System Events" to set frontmost of process "MLXWhisperGUI" to true'], 
+                        capture_output=True, timeout=2)
+                except:
+                    pass
+        except Exception:
+            pass
+    
     def run(self):
         """Start the GUI application"""
         # Check for single instance
         if not self.instance_lock.acquire_lock():
-            messagebox.showwarning(
-                "Already Running", 
-                "MLX Whisper GUI is already running. Only one instance is allowed at a time."
+            # Try to bring existing instance to front
+            self._try_focus_existing_instance()
+            
+            # Show user-friendly message
+            response = messagebox.askquestion(
+                "MLX Whisper GUI Already Running", 
+                "MLX Whisper GUI is already running.\n\n"
+                "Only one instance can run at a time for optimal performance.\n\n"
+                "Would you like to close this window and use the existing instance?",
+                icon='info'
             )
-            self.root.destroy()
-            return False
+            
+            if response == 'yes':
+                self.root.destroy()
+                return False
+            else:
+                # User chose to keep trying, destroy current instance anyway
+                self.root.destroy()
+                return False
         
         try:
+            # Bring window to front on startup
+            self.root.after(100, self.bring_to_front)
             self.root.mainloop()
         finally:
             self.instance_lock.release_lock()
         
         return True
+    
+    def _try_focus_existing_instance(self):
+        """Try to focus the existing instance"""
+        try:
+            if platform.system() == "Darwin":
+                # Try to activate the existing MLX Whisper GUI process
+                subprocess.run([
+                    'osascript', '-e',
+                    'tell application "System Events" to tell process "MLXWhisperGUI" to set frontmost to true'
+                ], capture_output=True, timeout=2)
+        except Exception:
+            pass
 
 
 def main():
-    """Main entry point"""
+    """Main entry point with crash recovery"""
     # Setup FFmpeg path for bundled app
     setup_ffmpeg_path()
     
-    app = WhisperGUI()
-    app.run()
+    # Clean up any stale lock files from previous crashes
+    try:
+        temp_lock = SingleInstanceLock()
+        # Check if there are stale locks without acquiring them
+        if platform.system() == "Darwin":
+            lock_dir = os.path.expanduser("~/Library/Application Support/MLXWhisperGUI")
+            if os.path.exists(lock_dir):
+                for file in os.listdir(lock_dir):
+                    if file.endswith('.lock') or file.endswith('.pid'):
+                        file_path = os.path.join(lock_dir, file)
+                        try:
+                            # Check if file is older than 1 hour (likely stale)
+                            if os.path.getmtime(file_path) < time.time() - 3600:
+                                os.remove(file_path)
+                        except:
+                            pass
+    except Exception:
+        pass
+    
+    # Create and run the application
+    try:
+        app = WhisperGUI()
+        success = app.run()
+        
+        if not success:
+            # Application didn't start (likely due to another instance)
+            return
+            
+    except Exception as e:
+        # Handle unexpected crashes
+        import traceback
+        error_msg = f"An unexpected error occurred:\n\n{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+        
+        try:
+            # Try to show error dialog
+            root = tk.Tk()
+            root.withdraw()  # Hide main window
+            messagebox.showerror("MLX Whisper GUI - Fatal Error", error_msg)
+            root.destroy()
+        except:
+            # If GUI fails, print to console
+            print(f"MLX Whisper GUI Fatal Error: {error_msg}")
+        
+        # Clean up any locks
+        try:
+            temp_lock = SingleInstanceLock()
+            temp_lock.release_lock()
+        except:
+            pass
 
 
 if __name__ == "__main__":
