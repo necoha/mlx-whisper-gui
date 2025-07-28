@@ -15,13 +15,20 @@ A sophisticated graphical interface for MLX Whisper transcription on Apple Silic
 - **Smart Progress Tracking**: Real-time progress bar with ETA estimation
 - **Batch Processing**: Process multiple audio files simultaneously
 - **Auto-save**: Automatic transcript saving with original filename
-- **Single Instance**: Prevents multiple app instances for resource efficiency
+- **Advanced Process Management**: Comprehensive single instance lock with ffmpeg double-launch prevention
 
 ### Advanced Progress System
 - **Intelligent ETA Calculation**: Adapts to MLX Whisper's 2-4x realtime processing speed
 - **Smooth Progress Updates**: Anti-jitter algorithm for stable progress display
 - **Processing Speed Display**: Shows completion time and realtime factor
 - **Stage Tracking**: Clear indication of loading, processing, and finalizing phases
+
+### Process Management & Stability
+- **Process Group Isolation**: Prevents ffmpeg subprocess interference
+- **Orphaned Process Detection**: Automatic cleanup of stray ffmpeg processes
+- **Real-time Process Monitoring**: Continuous 30-second health checks
+- **Multi-layer Cleanup**: Graceful degradation with multiple fallback mechanisms
+- **Enhanced Signal Handling**: Proper SIGPIPE and process termination management
 
 ### User Experience
 - **Audio Duration Detection**: Displays file length using ffprobe
@@ -127,6 +134,8 @@ pyinstaller MLXWhisperGUI.spec
 - **No Progress Display**: Ensure ffprobe is available in system PATH
 - **Slow Processing**: Check available memory and close other applications
 - **Audio Not Detected**: Verify file format is supported
+- **App Won't Start**: Check for stale processes; app automatically cleans them on startup
+- **Process Conflicts**: Multi-layer process management prevents ffmpeg double-launch issues
 
 ### Performance Tips
 - Use WAV or FLAC for fastest processing
@@ -160,13 +169,20 @@ MIT License - see LICENSE file for details.
 - **スマート進捗追跡**: ETA予測付きリアルタイム進捗バー
 - **バッチ処理**: 複数の音声ファイルを同時処理
 - **自動保存**: 元ファイル名での転写結果自動保存
-- **シングルインスタンス**: リソース効率のため複数アプリ起動を防止
+- **高度なプロセス管理**: ffmpeg二重起動防止を含む包括的なシングルインスタンスロック
 
 ### 高度な進捗システム
 - **インテリジェントETA計算**: MLX Whisperの2-4倍速リアルタイム処理速度に適応
 - **スムースな進捗更新**: 安定した進捗表示のためのアンチジッターアルゴリズム
 - **処理速度表示**: 完了時間とリアルタイム係数の表示
 - **段階追跡**: 読み込み、処理、仕上げ段階の明確な表示
+
+### プロセス管理と安定性
+- **プロセスグループ分離**: ffmpegサブプロセスの干渉を防止
+- **孤児プロセス検出**: 迷子のffmpegプロセスの自動クリーンアップ
+- **リアルタイムプロセス監視**: 30秒間隔での継続的なヘルスチェック
+- **多層クリーンアップ**: 複数のフォールバック機構による緩やかな劣化
+- **拡張シグナル処理**: 適切なSIGPIPEとプロセス終了管理
 
 ### ユーザー体験
 - **音声長検出**: ffprobeを使用したファイル長表示
@@ -272,6 +288,8 @@ pyinstaller MLXWhisperGUI.spec
 - **進捗表示なし**: システムPATHでffprobeが利用可能か確認
 - **処理が遅い**: 利用可能メモリを確認し他のアプリケーションを終了
 - **音声検出されない**: サポートされているファイル形式か確認
+- **アプリが起動しない**: 古いプロセスを確認；アプリが起動時に自動クリーンアップします
+- **プロセス競合**: 多層プロセス管理がffmpeg二重起動問題を防止します
 
 ### パフォーマンスのヒント
 - 最速処理にはWAVまたはFLACを使用
