@@ -1,77 +1,56 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
-# DMG作成スクリプト for MLX Whisper GUI
+# MLX Whisper GUI DMG Creation Script
 
-set -e
+APP_NAME="MLXWhisperGUI"
+APP_PATH="./dist/${APP_NAME}.app"
+DMG_NAME="${APP_NAME}"
+VOLUME_NAME="${APP_NAME}"
+SOURCE_FOLDER="./dmg_temp"
+DMG_PATH="./dist/${DMG_NAME}.dmg"
 
-APP_NAME="MLX Whisper GUI"
-APP_PATH="dist/MLX Whisper GUI.app"
-DMG_NAME="MLXWhisperGUI-v1.1.0"
-DMG_PATH="${DMG_NAME}.dmg"
-VOLUME_NAME="MLX Whisper GUI"
-SOURCE_FOLDER="dmg_temp"
+# Check if app exists
+if [ ! -d "$APP_PATH" ]; then
+    echo "Error: App bundle not found at $APP_PATH"
+    echo "Please build the app first using PyInstaller"
+    exit 1
+fi
 
-# クリーンアップ
-echo "🧹 Cleaning up previous builds..."
-rm -rf "${SOURCE_FOLDER}"
-rm -f "${DMG_PATH}"
+# Clean up any previous temp folder
+rm -rf "$SOURCE_FOLDER"
 
-# 一時フォルダ作成
-echo "📁 Creating temporary DMG folder..."
-mkdir -p "${SOURCE_FOLDER}"
-mkdir -p "${SOURCE_FOLDER}/.background"
+# Create temporary folder for DMG contents
+mkdir -p "$SOURCE_FOLDER"
 
-# アプリケーションをコピー
-echo "📱 Copying application..."
-cp -R "${APP_PATH}" "${SOURCE_FOLDER}/"
+# Copy app to temp folder
+cp -R "$APP_PATH" "$SOURCE_FOLDER/"
 
-# アプリケーションフォルダへのシンボリックリンクを作成
-echo "🔗 Creating Applications symlink..."
-ln -s /Applications "${SOURCE_FOLDER}/Applications"
+# Create Applications symlink for easy drag-and-drop installation
+ln -s /Applications "$SOURCE_FOLDER/Applications"
 
-# README ファイルを作成
-echo "📝 Creating README..."
-cat > "${SOURCE_FOLDER}/README.txt" << 'EOF'
-MLX Whisper GUI v1.1.0
-======================
+# Remove any existing DMG
+rm -f "$DMG_PATH"
 
-インストール方法:
-1. 「MLX Whisper GUI.app」をアプリケーションフォルダにドラッグ&ドロップ
-2. 初回起動時はセキュリティ設定で許可が必要な場合があります
+echo "Creating DMG..."
 
-機能:
-• 高精度音声転写 (MLX Whisper large-v3)
-• バッチ処理対応
-• cline統合議事録機能
-• VS Code風インターフェース
-
-システム要件:
-• macOS 10.15以上
-• Apple Silicon (M1/M2/M3) 推奨
-• メモリ 8GB以上推奨
-
-お問い合わせ:
-github.com/mlx-whisper-gui
-
-EOF
-
-# DMGを作成
-echo "💿 Creating DMG..."
-hdiutil create -volname "${VOLUME_NAME}" \
-               -srcfolder "${SOURCE_FOLDER}" \
+# Create DMG with nice layout
+hdiutil create -volname "$VOLUME_NAME" \
+               -srcfolder "$SOURCE_FOLDER" \
                -ov \
                -format UDZO \
                -imagekey zlib-level=9 \
-               "${DMG_PATH}"
+               "$DMG_PATH"
 
-# 一時フォルダを削除
-echo "🧹 Cleaning up temporary files..."
-rm -rf "${SOURCE_FOLDER}"
-
-echo "✅ DMG creation completed!"
-echo "📦 Output: ${DMG_PATH}"
-echo "📏 Size: $(du -h "${DMG_PATH}" | cut -f1)"
-
-# DMGを開いて確認
-echo "🔍 Opening DMG for verification..."
-open "${DMG_PATH}"
+if [ $? -eq 0 ]; then
+    echo "DMG created successfully: $DMG_PATH"
+    
+    # Clean up temp folder
+    rm -rf "$SOURCE_FOLDER"
+    
+    # Show DMG size
+    echo "DMG size: $(du -h "$DMG_PATH" | cut -f1)"
+else
+    echo "Error creating DMG"
+    rm -rf "$SOURCE_FOLDER"
+    exit 1
+fi
