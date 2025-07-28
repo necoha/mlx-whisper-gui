@@ -30,10 +30,18 @@ class SingleInstanceLock:
         self.lock_file_handle = None
         self.socket = None
         self.pid_file_path = None
+        self.child_processes = []  # Track child processes like ffmpeg
+        self.process_group_id = None  # Track process group for better cleanup
         
     def acquire_lock(self):
         """Try to acquire the single instance lock using multiple methods"""
         try:
+            # Kill any stale processes first
+            self._cleanup_stale_processes()
+            
+            # Set up process group for better child process management
+            self._setup_process_group()
+            
             # Method 1: File-based locking with fcntl (most reliable on Unix)
             if self._try_file_lock():
                 # Method 2: Socket-based lock as backup
@@ -47,6 +55,7 @@ class SingleInstanceLock:
                         signal.signal(signal.SIGINT, self._signal_handler)
                         return True
             
+            self.release_lock()
             return False
             
         except Exception as e:
@@ -157,8 +166,11 @@ class SingleInstanceLock:
         sys.exit(0)
     
     def release_lock(self):
-        """Release all locks"""
+        """Release all locks and cleanup child processes"""
         try:
+            # Terminate child processes (like ffmpeg)
+            self._cleanup_child_processes()
+            
             # Release file lock
             if self.lock_file_handle:
                 try:
@@ -214,6 +226,117 @@ class SingleInstanceLock:
             
         except:
             return False
+    
+    def _setup_process_group(self):
+        """Set up process group for better child process management"""
+        try:
+            if platform.system() != "Windows":
+                # Create a new process group on Unix systems
+                self.process_group_id = os.getpid()
+                os.setpgrp()  # Make this process the group leader
+        except Exception as e:
+            print(f"Debug: Failed to set up process group: {e}")
+
+    def _cleanup_stale_processes(self):
+        """Clean up any stale processes that might interfere"""
+        try:
+            import psutil
+            current_pid = os.getpid()
+            
+            # Find processes with our app name or related ffmpeg processes
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'ppid']):
+                try:
+                    if proc.info['pid'] == current_pid:
+                        continue
+                        
+                    # Check if it's our app, ffmpeg, or child processes
+                    cmdline = proc.info.get('cmdline', [])
+                    proc_name = proc.info.get('name', '').lower()
+                    
+                    # Look for our app processes
+                    is_our_app = any(self.app_name.lower() in str(arg).lower() for arg in cmdline)
+                    
+                    # Look for ffmpeg processes that might be orphaned
+                    is_ffmpeg = proc_name == 'ffmpeg' or 'ffmpeg' in str(cmdline)
+                    
+                    if is_our_app or is_ffmpeg:
+                        # Check if process is truly dead/zombie or orphaned
+                        try:
+                            status = proc.status()
+                            if status in [psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD]:
+                                proc.terminate()
+                                proc.wait(timeout=1)
+                            elif is_ffmpeg:
+                                # For ffmpeg processes, check if parent is still alive
+                                try:
+                                    parent = proc.parent()
+                                    if parent is None or not parent.is_running():
+                                        # Orphaned ffmpeg process
+                                        proc.terminate()
+                                        proc.wait(timeout=2)
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    # Parent doesn't exist, terminate orphaned process
+                                    proc.terminate()
+                                    proc.wait(timeout=2)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                            continue
+                            
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                    continue
+                    
+        except ImportError:
+            # psutil not available, use basic cleanup
+            self._basic_process_cleanup()
+        except Exception as e:
+            print(f"Debug: Error cleaning up stale processes: {e}")
+    
+    def _basic_process_cleanup(self):
+        """Basic process cleanup without psutil"""
+        try:
+            if platform.system() == "Darwin":
+                # Use pkill to clean up processes on macOS
+                subprocess.run(['pkill', '-f', self.app_name], capture_output=True)
+                subprocess.run(['pkill', '-f', 'ffmpeg.*whisper'], capture_output=True)
+        except Exception:
+            pass
+    
+    def _cleanup_child_processes(self):
+        """Clean up tracked child processes and entire process group"""
+        # First, clean up explicitly tracked processes
+        for proc in self.child_processes[:]:
+            try:
+                if proc.poll() is None:  # Process is still running
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                self.child_processes.remove(proc)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    proc.kill()
+                    self.child_processes.remove(proc)
+                except:
+                    pass
+            except:
+                pass
+        
+        # Then, clean up entire process group (including ffmpeg children)
+        try:
+            if platform.system() != "Windows" and self.process_group_id:
+                # Kill all processes in our process group
+                os.killpg(self.process_group_id, signal.SIGTERM)
+                time.sleep(0.5)  # Give processes time to terminate gracefully
+                try:
+                    os.killpg(self.process_group_id, signal.SIGKILL)  # Force kill if needed
+                except (OSError, ProcessLookupError):
+                    pass  # Process group already gone
+        except (OSError, ProcessLookupError) as e:
+            # Process group doesn't exist or already cleaned up
+            pass
+        except Exception as e:
+            print(f"Debug: Error cleaning up process group: {e}")
+    
+    def register_child_process(self, process):
+        """Register a child process for cleanup"""
+        self.child_processes.append(process)
 
 
 def setup_ffmpeg_path():
@@ -235,6 +358,19 @@ def setup_ffmpeg_path():
             
             # Set FFMPEG_BINARY environment variable for mlx_whisper
             os.environ['FFMPEG_BINARY'] = ffmpeg_path
+            
+            # Set process isolation and control flags
+            os.environ['FFMPEG_ISOLATION'] = '1'
+            os.environ['FFMPEG_HIDE_BANNER'] = '1'  # Reduce noise
+            os.environ['FFMPEG_NOSTDIN'] = '1'      # Prevent stdin issues
+            
+    # Always set these for better ffmpeg behavior
+    os.environ['PYTHONUNBUFFERED'] = '1'  # Ensure output is not buffered
+    
+    # Set up signal handling for child processes
+    if platform.system() != "Windows":
+        # Ignore SIGPIPE to prevent ffmpeg issues
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 
 class WhisperGUI:
@@ -246,6 +382,9 @@ class WhisperGUI:
         
         # Initialize single instance lock
         self.instance_lock = SingleInstanceLock()
+        
+        # Set up process monitoring
+        self._setup_process_monitoring()
         
         # Set up window close handler
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -405,7 +544,10 @@ class WhisperGUI:
                 ffprobe_cmd, "-v", "quiet", "-print_format", "json", 
                 "-show_format", file_path
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            # Use better process management for ffmpeg
+            result = subprocess.run(cmd, capture_output=True, text=True, 
+                                  creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if platform.system() == "Windows" else 0,
+                                  start_new_session=True if platform.system() != "Windows" else False)
             if result.returncode == 0:
                 data = json.loads(result.stdout)
                 duration = float(data['format']['duration'])
@@ -868,6 +1010,42 @@ class WhisperGUI:
             print(f"Batch auto-save error: {e}")
             self.status_var.set("Error: Could not auto-save batch results")
     
+    def _setup_process_monitoring(self):
+        """Set up periodic process monitoring to catch orphaned ffmpeg processes"""
+        def monitor_processes():
+            try:
+                import psutil
+                # Check for orphaned ffmpeg processes every 30 seconds
+                for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'ppid']):
+                    try:
+                        proc_info = proc.info
+                        if 'ffmpeg' in proc_info.get('name', '').lower():
+                            cmdline = proc_info.get('cmdline', [])
+                            # Check if this ffmpeg is processing audio (likely from our app)
+                            if any('s16le' in str(arg) or '16000' in str(arg) for arg in cmdline):
+                                # Check if parent is still alive and is our app
+                                try:
+                                    parent = proc.parent()
+                                    if parent is None or not parent.is_running():
+                                        print(f"Debug: Terminating orphaned ffmpeg process {proc_info['pid']}")
+                                        proc.terminate()
+                                        proc.wait(timeout=2)
+                                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                                    pass
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except ImportError:
+                pass  # psutil not available
+            except Exception as e:
+                print(f"Debug: Process monitoring error: {e}")
+            
+            # Schedule next check
+            if hasattr(self, 'root') and self.root.winfo_exists():
+                self.root.after(30000, monitor_processes)  # Check every 30 seconds
+        
+        # Start monitoring after a delay
+        self.root.after(5000, monitor_processes)  # Start after 5 seconds
+
     def on_closing(self):
         """Handle window closing event"""
         self.instance_lock.release_lock()
