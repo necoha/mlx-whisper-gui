@@ -55,6 +55,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='MLXWhisperGUI.app',
-    icon=None,
-    bundle_identifier=None,
+    icon='icon.icns',
+    bundle_identifier='com.mlx.whisper.gui',
 )
