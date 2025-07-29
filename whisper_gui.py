@@ -20,6 +20,196 @@ import time
 import fcntl
 import signal
 import atexit
+import weakref
+import requests
+import urllib.parse
+
+
+class ProcessManager:
+    """Enhanced process management for ffmpeg and child processes"""
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialize()
+        return cls._instance
+    
+    def _initialize(self):
+        self.active_processes = []
+        self.process_groups = []
+        self.monitoring_enabled = True
+        self.monitor_thread = None
+        self.lock = threading.RLock()
+        
+        # Register cleanup at exit
+        atexit.register(self.cleanup_all)
+        
+        # Set up signal handlers for graceful shutdown
+        if platform.system() != "Windows":
+            signal.signal(signal.SIGTERM, self._signal_handler)
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals"""
+        print(f"Debug: ProcessManager received signal {signum}, cleaning up...")
+        self.cleanup_all()
+    
+    def register_process(self, process):
+        """Register a process for tracking"""
+        with self.lock:
+            self.active_processes.append(weakref.ref(process))
+            return process
+    
+    def create_process_group(self):
+        """Create a new process group for better isolation"""
+        if platform.system() != "Windows":
+            try:
+                # Create new process group
+                pgid = os.setpgrp()
+                self.process_groups.append(pgid)
+                return pgid
+            except OSError:
+                return None
+        return None
+    
+    def kill_ffmpeg_processes(self):
+        """Aggressively kill all ffmpeg processes"""
+        try:
+            import psutil
+            killed_count = 0
+            
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    proc_info = proc.info
+                    proc_name = proc_info.get('name', '').lower()
+                    cmdline = proc_info.get('cmdline', [])
+                    
+                    # Check if it's an ffmpeg process
+                    if ('ffmpeg' in proc_name or 
+                        any('ffmpeg' in str(arg).lower() for arg in cmdline)):
+                        
+                        # Additional check for audio processing patterns
+                        audio_patterns = ['s16le', '16000', 'whisper', 'wav', 'mp3', 'mp4']
+                        if any(pattern in str(cmdline).lower() for pattern in audio_patterns):
+                            print(f"Debug: Killing ffmpeg process {proc_info['pid']}: {proc_name}")
+                            try:
+                                proc.terminate()
+                                proc.wait(timeout=2)
+                                killed_count += 1
+                            except psutil.TimeoutExpired:
+                                proc.kill()
+                                killed_count += 1
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                                
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            if killed_count > 0:
+                print(f"Debug: Killed {killed_count} ffmpeg processes")
+                
+        except ImportError:
+            # Fallback to pkill if psutil not available
+            try:
+                subprocess.run(['pkill', '-f', 'ffmpeg'], capture_output=True, timeout=5)
+                subprocess.run(['killall', 'ffmpeg'], capture_output=True, timeout=5)
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+    
+    def cleanup_all(self):
+        """Clean up all tracked processes and process groups"""
+        with self.lock:
+            self.monitoring_enabled = False
+            
+            # Clean up tracked processes
+            for proc_ref in self.active_processes[:]:
+                proc = proc_ref()
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except (subprocess.TimeoutExpired, OSError):
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+            
+            # Kill all ffmpeg processes
+            self.kill_ffmpeg_processes()
+            
+            # Clean up process groups
+            for pgid in self.process_groups:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                    time.sleep(0.5)
+                    os.killpg(pgid, signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+            
+            self.active_processes.clear()
+            self.process_groups.clear()
+    
+    def start_monitoring(self):
+        """Start background monitoring of processes"""
+        if self.monitor_thread is None or not self.monitor_thread.is_alive():
+            self.monitor_thread = threading.Thread(target=self._monitor_processes, daemon=True)
+            self.monitor_thread.start()
+    
+    def _monitor_processes(self):
+        """Background process monitoring"""
+        while self.monitoring_enabled:
+            try:
+                with self.lock:
+                    # Clean up dead process references
+                    self.active_processes = [ref for ref in self.active_processes if ref() is not None]
+                
+                # Check for orphaned ffmpeg processes every 10 seconds
+                self._check_orphaned_ffmpeg()
+                
+                time.sleep(10)
+            except Exception as e:
+                print(f"Debug: Process monitoring error: {e}")
+                time.sleep(5)
+    
+    def _check_orphaned_ffmpeg(self):
+        """Check for and clean up orphaned ffmpeg processes"""
+        try:
+            import psutil
+            current_pid = os.getpid()
+            
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'ppid']):
+                try:
+                    proc_info = proc.info
+                    if proc_info['pid'] == current_pid:
+                        continue
+                        
+                    proc_name = proc_info.get('name', '').lower()
+                    cmdline = proc_info.get('cmdline', [])
+                    
+                    if 'ffmpeg' in proc_name or any('ffmpeg' in str(arg).lower() for arg in cmdline):
+                        # Check if it's processing audio
+                        audio_patterns = ['s16le', '16000', 'whisper']
+                        if any(pattern in str(cmdline).lower() for pattern in audio_patterns):
+                            try:
+                                parent = proc.parent()
+                                # If parent is dead or not our app, terminate
+                                if parent is None or not parent.is_running():
+                                    print(f"Debug: Terminating orphaned ffmpeg {proc_info['pid']}")
+                                    proc.terminate()
+                                    proc.wait(timeout=2)
+                            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                                pass
+                                
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+                    
+        except ImportError:
+            pass
 
 
 class SingleInstanceLock:
@@ -30,8 +220,10 @@ class SingleInstanceLock:
         self.lock_file_handle = None
         self.socket = None
         self.pid_file_path = None
-        self.child_processes = []  # Track child processes like ffmpeg
-        self.process_group_id = None  # Track process group for better cleanup
+        
+        # Initialize enhanced process manager
+        self.process_manager = ProcessManager()
+        self.process_manager.start_monitoring()
         
     def acquire_lock(self):
         """Try to acquire the single instance lock using multiple methods"""
@@ -168,8 +360,8 @@ class SingleInstanceLock:
     def release_lock(self):
         """Release all locks and cleanup child processes"""
         try:
-            # Terminate child processes (like ffmpeg)
-            self._cleanup_child_processes()
+            # Use enhanced process manager for cleanup
+            self.process_manager.cleanup_all()
             
             # Release file lock
             if self.lock_file_handle:
@@ -300,43 +492,13 @@ class SingleInstanceLock:
         except Exception:
             pass
     
-    def _cleanup_child_processes(self):
-        """Clean up tracked child processes and entire process group"""
-        # First, clean up explicitly tracked processes
-        for proc in self.child_processes[:]:
-            try:
-                if proc.poll() is None:  # Process is still running
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                self.child_processes.remove(proc)
-            except (subprocess.TimeoutExpired, OSError):
-                try:
-                    proc.kill()
-                    self.child_processes.remove(proc)
-                except:
-                    pass
-            except:
-                pass
-        
-        # Then, clean up entire process group (including ffmpeg children)
-        try:
-            if platform.system() != "Windows" and self.process_group_id:
-                # Kill all processes in our process group
-                os.killpg(self.process_group_id, signal.SIGTERM)
-                time.sleep(0.5)  # Give processes time to terminate gracefully
-                try:
-                    os.killpg(self.process_group_id, signal.SIGKILL)  # Force kill if needed
-                except (OSError, ProcessLookupError):
-                    pass  # Process group already gone
-        except (OSError, ProcessLookupError) as e:
-            # Process group doesn't exist or already cleaned up
-            pass
         except Exception as e:
             print(f"Debug: Error cleaning up process group: {e}")
     
     def register_child_process(self, process):
-        """Register a child process for cleanup"""
-        self.child_processes.append(process)
+        """Register a child process for cleanup (deprecated - use ProcessManager)"""
+        # Redirect to ProcessManager
+        return self.process_manager.register_process(process)
 
 
 def setup_ffmpeg_path():
@@ -383,6 +545,9 @@ class WhisperGUI:
         # Initialize single instance lock
         self.instance_lock = SingleInstanceLock()
         
+        # Initialize global process manager
+        self.process_manager = ProcessManager()
+        
         # Set up process monitoring
         self._setup_process_monitoring()
         
@@ -421,14 +586,29 @@ class WhisperGUI:
         
         self.create_widgets()
         
+        # Load saved settings
+        self.load_settings()
+        
     def create_widgets(self):
-        # Main frame
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
         
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
+        
+        # Create tabs
+        self.create_transcription_tab()
+        self.create_minutes_tab()
+        self.create_settings_tab()
+    
+    def create_transcription_tab(self):
+        # Main transcription frame
+        main_frame = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(main_frame, text="🎤 Transcription")
+        
+        # Configure grid weights
         main_frame.columnconfigure(1, weight=1)
         main_frame.rowconfigure(6, weight=1)
         
@@ -497,6 +677,102 @@ class WhisperGUI:
         self.status_var.set("Ready - MLX Whisper for Apple Silicon")
         status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.grid(row=7, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
+    
+    def create_minutes_tab(self):
+        # Meeting minutes frame
+        minutes_frame = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(minutes_frame, text="📝 Meeting Minutes")
+        
+        # Configure grid weights
+        minutes_frame.columnconfigure(0, weight=1)
+        minutes_frame.rowconfigure(2, weight=1)
+        
+        # Instructions
+        instructions = ttk.Label(minutes_frame, 
+            text="Generate meeting minutes from transcription using AI assistance",
+            font=('TkDefaultFont', 10))
+        instructions.grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
+        
+        # Generate button
+        generate_frame = ttk.Frame(minutes_frame)
+        generate_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        self.generate_minutes_btn = ttk.Button(generate_frame, text="🤖 Generate Minutes", 
+                                             command=self.generate_minutes, state=tk.DISABLED)
+        self.generate_minutes_btn.pack(side=tk.LEFT)
+        
+        # Progress indicator for minutes generation
+        self.minutes_progress = ttk.Progressbar(generate_frame, mode='indeterminate')
+        self.minutes_progress.pack(side=tk.LEFT, padx=(10, 0), fill=tk.X, expand=True)
+        
+        # Minutes text area
+        self.minutes_text = scrolledtext.ScrolledText(minutes_frame, wrap=tk.WORD, height=20)
+        self.minutes_text.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        
+        # Save minutes button
+        save_minutes_frame = ttk.Frame(minutes_frame)
+        save_minutes_frame.grid(row=3, column=0, sticky=(tk.W, tk.E))
+        
+        ttk.Button(save_minutes_frame, text="💾 Save Minutes", 
+                  command=self.save_minutes).pack(side=tk.LEFT)
+        
+        ttk.Button(save_minutes_frame, text="📋 Copy Minutes", 
+                  command=self.copy_minutes).pack(side=tk.LEFT, padx=(10, 0))
+    
+    def create_settings_tab(self):
+        # Settings frame
+        settings_frame = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(settings_frame, text="⚙️ Settings")
+        
+        # Configure grid weights
+        settings_frame.columnconfigure(1, weight=1)
+        
+        # Claude API Settings
+        api_group = ttk.LabelFrame(settings_frame, text="Claude API Configuration", padding="10")
+        api_group.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 20))
+        api_group.columnconfigure(1, weight=1)
+        
+        ttk.Label(api_group, text="API Endpoint:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        self.api_endpoint_var = tk.StringVar(value="https://api.anthropic.com/v1/messages")
+        api_endpoint_entry = ttk.Entry(api_group, textvariable=self.api_endpoint_var, width=50)
+        api_endpoint_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=(0, 5))
+        
+        ttk.Label(api_group, text="API Key:").grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
+        self.api_key_var = tk.StringVar()
+        api_key_entry = ttk.Entry(api_group, textvariable=self.api_key_var, show="*", width=50)
+        api_key_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(0, 5))
+        
+        # Test API button
+        ttk.Button(api_group, text="🔍 Test Connection", 
+                  command=self.test_api_connection).grid(row=2, column=0, columnspan=2, pady=(10, 0))
+        
+        # Minutes Prompt Settings
+        prompt_group = ttk.LabelFrame(settings_frame, text="Meeting Minutes Prompts", padding="10")
+        prompt_group.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 20))
+        prompt_group.columnconfigure(0, weight=1)
+        prompt_group.rowconfigure(1, weight=1)
+        
+        ttk.Label(prompt_group, text="Minutes Generation Prompt:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        
+        self.minutes_prompt_var = tk.StringVar(value="""Please create professional meeting minutes from the following transcript. Include:
+
+1. **Meeting Summary**: Brief overview of the main topics discussed
+2. **Key Decisions**: Important decisions made during the meeting
+3. **Action Items**: Tasks assigned with responsible parties (if mentioned)
+4. **Next Steps**: Planned follow-up actions or next meetings
+
+Format the output in clear, professional language suitable for business documentation.
+
+Transcript:
+{transcript}""")
+        
+        self.minutes_prompt_text = scrolledtext.ScrolledText(prompt_group, wrap=tk.WORD, height=12)
+        self.minutes_prompt_text.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.minutes_prompt_text.insert('1.0', self.minutes_prompt_var.get())
+        
+        # Save settings button
+        ttk.Button(settings_frame, text="💾 Save Settings", 
+                  command=self.save_settings).grid(row=2, column=0, columnspan=2, pady=(10, 0))
         
     def browse_file(self):
         """Open file browser to select audio file"""
@@ -676,8 +952,17 @@ class WhisperGUI:
     def transcribe_audio(self):
         """Perform audio transcription using MLX Whisper"""
         try:
+            # First, aggressively clean up any existing ffmpeg processes
+            print("Debug: Cleaning up existing ffmpeg processes before transcription")
+            self.process_manager.kill_ffmpeg_processes()
+            time.sleep(1)  # Give processes time to die
+            
             model_name = self.model_var.get()
             language = self.language_var.get() if self.language_var.get() != "auto" else None
+            
+            # Create new process group for isolation
+            pgid = self.process_manager.create_process_group()
+            print(f"Debug: Created process group {pgid} for transcription")
             
             # Load MLX model
             self.root.after(0, lambda: self.status_var.set(f"Loading {model_name} model..."))
@@ -730,11 +1015,33 @@ class WhisperGUI:
             progress_thread = threading.Thread(target=progress_updater, daemon=True)
             progress_thread.start()
             
-            result = mlx_whisper.transcribe(
-                self.selected_file.get(),
-                path_or_hf_repo=mlx_model_name,
-                language=language
-            )
+            # Set environment variables for better process isolation
+            old_env = {}
+            try:
+                # Save original environment
+                for key in ['PYTHONUNBUFFERED', 'MLX_DISABLE_METAL_CAPTURE', 'OBJC_DISABLE_INITIALIZE_FORK_SAFETY']:
+                    old_env[key] = os.environ.get(key, None)
+                
+                # Set isolation variables
+                os.environ['PYTHONUNBUFFERED'] = '1'
+                os.environ['MLX_DISABLE_METAL_CAPTURE'] = '1'  # Prevent Metal capture issues
+                os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'  # macOS fork safety
+                
+                print(f"Debug: Starting MLX Whisper transcription with process group {pgid}")
+                result = mlx_whisper.transcribe(
+                    self.selected_file.get(),
+                    path_or_hf_repo=mlx_model_name,
+                    language=language
+                )
+                print("Debug: MLX Whisper transcription completed successfully")
+                
+            finally:
+                # Restore original environment
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
             
             # Finalizing
             self.root.after(0, lambda: self.update_progress_simulation("finalizing"))
@@ -747,6 +1054,10 @@ class WhisperGUI:
             self.root.after(0, lambda: self.show_error(error_msg))
         
         finally:
+            # Clean up any remaining ffmpeg processes
+            print("Debug: Final cleanup of ffmpeg processes after transcription")
+            self.process_manager.kill_ffmpeg_processes()
+            
             # Re-enable UI
             self.root.after(0, self.transcription_complete)
     
@@ -781,6 +1092,10 @@ class WhisperGUI:
         self.progress_bar.stop()
         self.progress_bar.config(mode="determinate")
         self.progress_var.set(100)
+        
+        # Enable meeting minutes button if transcript exists
+        if hasattr(self, 'result_text') and self.result_text.get(1.0, tk.END).strip():
+            self.generate_minutes_btn.config(state="normal")
         
         # Calculate actual processing time
         if hasattr(self, 'transcription_start_time') and self.transcription_start_time > 0:
@@ -924,14 +1239,37 @@ class WhisperGUI:
                 self.root.after(0, lambda f=filename: self.status_var.set(f"Processing {f}..."))
                 
                 try:
+                    # Clean up ffmpeg processes before each transcription
+                    print(f"Debug: Cleaning ffmpeg for batch file {current_file + 1}/{total_files}")
+                    self.process_manager.kill_ffmpeg_processes()
+                    time.sleep(0.5)  # Brief pause between files
+                    
                     # Transcribe current file using MLX large-v3
                     language = self.language_var.get() if self.language_var.get() != "auto" else None
                     mlx_model_name = "mlx-community/whisper-large-v3-mlx"
-                    result = mlx_whisper.transcribe(
-                        file_path,
-                        path_or_hf_repo=mlx_model_name,
-                        language=language
-                    )
+                    
+                    # Set isolation environment for batch processing
+                    old_env = {}
+                    try:
+                        for key in ['PYTHONUNBUFFERED', 'MLX_DISABLE_METAL_CAPTURE', 'OBJC_DISABLE_INITIALIZE_FORK_SAFETY']:
+                            old_env[key] = os.environ.get(key, None)
+                        
+                        os.environ['PYTHONUNBUFFERED'] = '1'
+                        os.environ['MLX_DISABLE_METAL_CAPTURE'] = '1'
+                        os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
+                        
+                        result = mlx_whisper.transcribe(
+                            file_path,
+                            path_or_hf_repo=mlx_model_name,
+                            language=language
+                        )
+                    finally:
+                        # Restore environment
+                        for key, value in old_env.items():
+                            if value is None:
+                                os.environ.pop(key, None)
+                            else:
+                                os.environ[key] = value
                     
                     transcript = result.get("text", "").strip()
                     all_transcripts.append(f"=== {filename} ===\n{transcript}\n")
@@ -1048,7 +1386,15 @@ class WhisperGUI:
 
     def on_closing(self):
         """Handle window closing event"""
+        print("Debug: Application closing, performing comprehensive cleanup")
+        
+        # Use enhanced process manager for thorough cleanup
+        self.process_manager.cleanup_all()
+        
+        # Release instance lock
         self.instance_lock.release_lock()
+        
+        # Destroy GUI
         self.root.destroy()
     
     def bring_to_front(self):
@@ -1069,6 +1415,217 @@ class WhisperGUI:
                 except:
                     pass
         except Exception:
+            pass
+    
+    def generate_minutes(self):
+        """Generate meeting minutes from transcript using Claude API"""
+        if not hasattr(self, 'result_text'):
+            messagebox.showerror("Error", "No transcript available for minutes generation")
+            return
+            
+        transcript = self.result_text.get(1.0, tk.END).strip()
+        if not transcript:
+            messagebox.showerror("Error", "Transcript is empty")
+            return
+        
+        # Get settings
+        api_endpoint = self.api_endpoint_var.get() or "https://api.anthropic.com/v1/messages"
+        api_key = self.api_key_var.get()
+        custom_prompt = self.prompt_text.get(1.0, tk.END).strip()
+        
+        if not api_key:
+            messagebox.showerror("Error", "Please configure Claude API key in Settings tab")
+            return
+        
+        # Disable button and show progress
+        self.generate_minutes_btn.config(state="disabled")
+        self.minutes_progress.start()
+        self.minutes_status.config(text="Generating meeting minutes...")
+        
+        def generate_in_thread():
+            try:
+                import requests
+                import json
+                
+                # Use custom prompt or default
+                if custom_prompt:
+                    prompt = custom_prompt.replace("{transcript}", transcript)
+                else:
+                    prompt = f"""Please analyze the following transcript and create comprehensive meeting minutes:
+
+{transcript}
+
+Please format the output as professional meeting minutes including:
+1. Meeting summary
+2. Key discussion points
+3. Decisions made
+4. Action items (if any)
+5. Next steps (if mentioned)
+
+Format in clear, professional language suitable for business documentation."""
+                
+                # API request
+                headers = {
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01"
+                }
+                
+                data = {
+                    "model": "claude-3-sonnet-20240229",
+                    "max_tokens": 4000,
+                    "messages": [{
+                        "role": "user",
+                        "content": prompt
+                    }]
+                }
+                
+                response = requests.post(api_endpoint, headers=headers, json=data, timeout=60)
+                response.raise_for_status()
+                
+                result = response.json()
+                minutes_text = result["content"][0]["text"]
+                
+                # Update UI in main thread
+                self.root.after(0, lambda: self.display_minutes(minutes_text))
+                
+            except Exception as e:
+                error_msg = f"Error generating minutes: {str(e)}"
+                self.root.after(0, lambda: self.show_minutes_error(error_msg))
+        
+        # Start generation in background thread
+        threading.Thread(target=generate_in_thread, daemon=True).start()
+    
+    def display_minutes(self, minutes_text):
+        """Display generated meeting minutes"""
+        self.minutes_text.delete(1.0, tk.END)
+        self.minutes_text.insert(tk.END, minutes_text)
+        
+        # Re-enable controls
+        self.generate_minutes_btn.config(state="normal")
+        self.save_minutes_btn.config(state="normal")
+        self.copy_minutes_btn.config(state="normal")
+        self.minutes_progress.stop()
+        self.minutes_status.config(text="Meeting minutes generated successfully")
+    
+    def show_minutes_error(self, error_msg):
+        """Show error during minutes generation"""
+        messagebox.showerror("Minutes Generation Error", error_msg)
+        self.generate_minutes_btn.config(state="normal")
+        self.minutes_progress.stop()
+        self.minutes_status.config(text="Error occurred during minutes generation")
+    
+    def test_api_connection(self):
+        """Test Claude API connection"""
+        api_endpoint = self.api_endpoint_var.get() or "https://api.anthropic.com/v1/messages"
+        api_key = self.api_key_var.get()
+        
+        if not api_key:
+            messagebox.showerror("Error", "Please enter API key first")
+            return
+        
+        def test_in_thread():
+            try:
+                import requests
+                
+                headers = {
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01"
+                }
+                
+                data = {
+                    "model": "claude-3-sonnet-20240229",
+                    "max_tokens": 100,
+                    "messages": [{
+                        "role": "user",
+                        "content": "Hello, this is a test message. Please respond with 'API connection successful'."
+                    }]
+                }
+                
+                response = requests.post(api_endpoint, headers=headers, json=data, timeout=30)
+                response.raise_for_status()
+                
+                self.root.after(0, lambda: messagebox.showinfo("Success", "API connection test successful!"))
+                
+            except Exception as e:
+                error_msg = f"API connection failed: {str(e)}"
+                self.root.after(0, lambda: messagebox.showerror("Connection Error", error_msg))
+        
+        threading.Thread(target=test_in_thread, daemon=True).start()
+    
+    def save_minutes(self):
+        """Save meeting minutes to file"""
+        if not hasattr(self, 'minutes_text'):
+            return
+            
+        minutes_content = self.minutes_text.get(1.0, tk.END).strip()
+        if not minutes_content:
+            messagebox.showwarning("Warning", "No meeting minutes to save")
+            return
+        
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".md",
+            filetypes=[("Markdown files", "*.md"), ("Text files", "*.txt"), ("All files", "*.*")],
+            title="Save Meeting Minutes"
+        )
+        
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(minutes_content)
+                messagebox.showinfo("Success", f"Meeting minutes saved to {filename}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save file: {str(e)}")
+    
+    def copy_minutes(self):
+        """Copy meeting minutes to clipboard"""
+        if not hasattr(self, 'minutes_text'):
+            return
+            
+        minutes_content = self.minutes_text.get(1.0, tk.END).strip()
+        if not minutes_content:
+            messagebox.showwarning("Warning", "No meeting minutes to copy")
+            return
+        
+        self.root.clipboard_clear()
+        self.root.clipboard_append(minutes_content)
+        messagebox.showinfo("Success", "Meeting minutes copied to clipboard")
+    
+    def save_settings(self):
+        """Save Claude API settings"""
+        settings = {
+            "api_endpoint": self.api_endpoint_var.get(),
+            "api_key": self.api_key_var.get(),
+            "custom_prompt": self.prompt_text.get(1.0, tk.END).strip()
+        }
+        
+        try:
+            settings_file = os.path.expanduser("~/.mlx_whisper_settings.json")
+            with open(settings_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+            messagebox.showinfo("Success", "Settings saved successfully")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save settings: {str(e)}")
+    
+    def load_settings(self):
+        """Load saved Claude API settings"""
+        try:
+            settings_file = os.path.expanduser("~/.mlx_whisper_settings.json")
+            if os.path.exists(settings_file):
+                with open(settings_file, 'r') as f:
+                    settings = json.load(f)
+                
+                self.api_endpoint_var.set(settings.get("api_endpoint", ""))
+                self.api_key_var.set(settings.get("api_key", ""))
+                
+                custom_prompt = settings.get("custom_prompt", "")
+                if custom_prompt:
+                    self.prompt_text.delete(1.0, tk.END)
+                    self.prompt_text.insert(tk.END, custom_prompt)
+                    
+        except Exception as e:
+            # Silently ignore settings loading errors
             pass
     
     def run(self):
