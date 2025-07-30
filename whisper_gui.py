@@ -44,6 +44,7 @@ class ProcessManager:
         self.monitoring_enabled = True
         self.monitor_thread = None
         self.lock = threading.RLock()
+        self._transcribing = False  # Track transcription state
         
         # Register cleanup at exit
         atexit.register(self.cleanup_all)
@@ -77,26 +78,42 @@ class ProcessManager:
                 return None
         return None
     
-    def kill_ffmpeg_processes(self):
-        """Aggressively kill all ffmpeg processes"""
+    def kill_ffmpeg_processes(self, force=False):
+        """Kill only stale or orphaned ffmpeg processes, not active transcription ones"""
+        with self.lock:
+            # Throttle ffmpeg killing to prevent excessive calls
+            current_time = time.time()
+            if not force and hasattr(self, '_last_ffmpeg_kill') and (current_time - self._last_ffmpeg_kill) < 5:
+                return  # Skip if called too recently (increased to 5 seconds)
+            
+            self._last_ffmpeg_kill = current_time
+        
+        # Only kill stale processes if forced (app shutdown) or if not currently transcribing
+        if not force and hasattr(self, '_transcribing') and self._transcribing:
+            print("Debug: Skipping ffmpeg cleanup during active transcription")
+            return
+        
         try:
             import psutil
             killed_count = 0
+            current_time = time.time()
             
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
                 try:
                     proc_info = proc.info
                     proc_name = proc_info.get('name', '').lower()
                     cmdline = proc_info.get('cmdline', [])
+                    create_time = proc_info.get('create_time', 0)
                     
                     # Check if it's an ffmpeg process
                     if ('ffmpeg' in proc_name or 
                         any('ffmpeg' in str(arg).lower() for arg in cmdline)):
                         
-                        # Additional check for audio processing patterns
-                        audio_patterns = ['s16le', '16000', 'whisper', 'wav', 'mp3', 'mp4']
-                        if any(pattern in str(cmdline).lower() for pattern in audio_patterns):
-                            print(f"Debug: Killing ffmpeg process {proc_info['pid']}: {proc_name}")
+                        # Only kill if it's been running for more than 5 minutes (likely stale)
+                        # or if force=True (app shutdown)
+                        process_age = current_time - create_time
+                        if force or process_age > 300:  # 5 minutes
+                            print(f"Debug: Killing stale ffmpeg process {proc_info['pid']} (age: {process_age:.1f}s)")
                             try:
                                 proc.terminate()
                                 proc.wait(timeout=2)
@@ -106,59 +123,64 @@ class ProcessManager:
                                 killed_count += 1
                             except (psutil.NoSuchProcess, psutil.AccessDenied):
                                 pass
-                                
+                        else:
+                            print(f"Debug: Keeping active ffmpeg process {proc_info['pid']} (age: {process_age:.1f}s)")
+                            
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
             
             if killed_count > 0:
-                print(f"Debug: Killed {killed_count} ffmpeg processes")
+                print(f"Debug: Killed {killed_count} stale ffmpeg processes")
                 
         except ImportError:
-            # Fallback to pkill if psutil not available
-            try:
-                subprocess.run(['pkill', '-f', 'ffmpeg'], capture_output=True, timeout=5)
-                subprocess.run(['killall', 'ffmpeg'], capture_output=True, timeout=5)
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                pass
+            # Avoid using pkill/killall as they can interfere with other applications
+            print("Debug: psutil not available, skipping ffmpeg cleanup to prevent interference")
     
     def cleanup_all(self):
-        """Clean up all tracked processes and process groups"""
-        with self.lock:
-            self.monitoring_enabled = False
-            
-            # Clean up tracked processes
-            for proc_ref in self.active_processes[:]:
-                proc = proc_ref()
-                if proc and proc.poll() is None:
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=2)
-                    except (subprocess.TimeoutExpired, OSError):
+        """Clean up all tracked processes and process groups - quick version"""
+        try:
+            with self.lock:
+                self.monitoring_enabled = False
+                
+                # Clean up tracked processes - with short timeout
+                for proc_ref in self.active_processes[:]:
+                    proc = proc_ref()
+                    if proc and proc.poll() is None:
                         try:
-                            proc.kill()
-                        except OSError:
-                            pass
-            
-            # Kill all ffmpeg processes
-            self.kill_ffmpeg_processes()
-            
-            # Clean up process groups
-            for pgid in self.process_groups:
-                try:
-                    os.killpg(pgid, signal.SIGTERM)
-                    time.sleep(0.5)
-                    os.killpg(pgid, signal.SIGKILL)
-                except (OSError, ProcessLookupError):
-                    pass
+                            proc.terminate()
+                            proc.wait(timeout=0.5)  # Reduced timeout
+                        except (subprocess.TimeoutExpired, OSError):
+                            try:
+                                proc.kill()
+                            except OSError:
+                                pass
+                
+                # Quick ffmpeg cleanup (force=True, no waiting)
+                self.kill_ffmpeg_processes(force=True)
+                
+                # Clean up process groups - don't wait
+                for pgid in self.process_groups:
+                    try:
+                        os.killpg(pgid, signal.SIGTERM)
+                        # Don't wait - just send SIGKILL immediately
+                        os.killpg(pgid, signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        pass
+        except Exception as e:
+            print(f"Debug: Quick cleanup error: {e}")
+            # Don't let cleanup errors block shutdown
             
             self.active_processes.clear()
             self.process_groups.clear()
     
     def start_monitoring(self):
-        """Start background monitoring of processes"""
-        if self.monitor_thread is None or not self.monitor_thread.is_alive():
-            self.monitor_thread = threading.Thread(target=self._monitor_processes, daemon=True)
-            self.monitor_thread.start()
+        """Start background monitoring of processes (only once)"""
+        with self.lock:
+            if self.monitor_thread is None or not self.monitor_thread.is_alive():
+                self.monitoring_enabled = True
+                self.monitor_thread = threading.Thread(target=self._monitor_processes, daemon=True)
+                self.monitor_thread.start()
+                print("Debug: ProcessManager monitoring started")
     
     def _monitor_processes(self):
         """Background process monitoring"""
@@ -168,19 +190,25 @@ class ProcessManager:
                     # Clean up dead process references
                     self.active_processes = [ref for ref in self.active_processes if ref() is not None]
                 
-                # Check for orphaned ffmpeg processes every 10 seconds
+                # Check for orphaned ffmpeg processes every 30 seconds (reduced frequency)
                 self._check_orphaned_ffmpeg()
                 
-                time.sleep(10)
+                time.sleep(30)
             except Exception as e:
                 print(f"Debug: Process monitoring error: {e}")
                 time.sleep(5)
     
     def _check_orphaned_ffmpeg(self):
-        """Check for and clean up orphaned ffmpeg processes"""
+        """Check for and clean up truly orphaned ffmpeg processes"""
+        # Skip if currently transcribing to avoid killing active processes
+        if hasattr(self, '_transcribing') and self._transcribing:
+            print("Debug: Skipping orphaned ffmpeg check during active transcription")
+            return
+            
         try:
             import psutil
             current_pid = os.getpid()
+            app_name = "MLXWhisperGUI"
             
             for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'ppid']):
                 try:
@@ -192,18 +220,24 @@ class ProcessManager:
                     cmdline = proc_info.get('cmdline', [])
                     
                     if 'ffmpeg' in proc_name or any('ffmpeg' in str(arg).lower() for arg in cmdline):
-                        # Check if it's processing audio
-                        audio_patterns = ['s16le', '16000', 'whisper']
-                        if any(pattern in str(cmdline).lower() for pattern in audio_patterns):
-                            try:
-                                parent = proc.parent()
-                                # If parent is dead or not our app, terminate
-                                if parent is None or not parent.is_running():
-                                    print(f"Debug: Terminating orphaned ffmpeg {proc_info['pid']}")
-                                    proc.terminate()
-                                    proc.wait(timeout=2)
-                            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
-                                pass
+                        try:
+                            parent = proc.parent()
+                            # Check if parent exists and is our application
+                            if parent is None or not parent.is_running():
+                                print(f"Debug: Found orphaned ffmpeg process {proc_info['pid']} - parent is dead")
+                                proc.terminate()
+                                proc.wait(timeout=2)
+                            else:
+                                # Check if parent is our application by checking the command line
+                                parent_cmdline = parent.cmdline()
+                                if parent_cmdline and not any(app_name in str(cmd) for cmd in parent_cmdline):
+                                    # Parent exists but is not our app - likely inherited from another process
+                                    print(f"Debug: Found ffmpeg process {proc_info['pid']} with foreign parent {parent.pid}")
+                                    # Don't terminate - might be from another legitimate application
+                                else:
+                                    print(f"Debug: Keeping ffmpeg process {proc_info['pid']} with valid parent {parent.pid}")
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                            pass
                                 
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
@@ -221,15 +255,18 @@ class SingleInstanceLock:
         self.socket = None
         self.pid_file_path = None
         
-        # Initialize enhanced process manager
+        # Use global process manager (initialized in main app)
         self.process_manager = ProcessManager()
-        self.process_manager.start_monitoring()
         
     def acquire_lock(self):
         """Try to acquire the single instance lock using multiple methods"""
         try:
             # Kill any stale processes first
             self._cleanup_stale_processes()
+            
+            # Check if another instance is already running
+            if self._check_existing_instance():
+                return False
             
             # Set up process group for better child process management
             self._setup_process_group()
@@ -252,6 +289,44 @@ class SingleInstanceLock:
             
         except Exception as e:
             print(f"Debug: Lock acquisition failed: {e}")
+            return False
+    
+    def _check_existing_instance(self):
+        """Check if another instance is already running"""
+        try:
+            # Check PID file first
+            if platform.system() == "Darwin":
+                pid_dir = os.path.expanduser("~/Library/Application Support/MLXWhisperGUI")
+            else:
+                pid_dir = tempfile.gettempdir()
+            
+            pid_file = os.path.join(pid_dir, f"{self.app_name}.pid")
+            
+            if os.path.exists(pid_file):
+                try:
+                    with open(pid_file, 'r') as f:
+                        pid = int(f.read().strip())
+                    
+                    # Check if process is still running
+                    try:
+                        os.kill(pid, 0)  # Signal 0 just checks if process exists
+                        # Process exists, check if it's our application
+                        import psutil
+                        proc = psutil.Process(pid)
+                        if 'MLXWhisperGUI' in proc.name() or 'whisper' in proc.name().lower():
+                            return True
+                    except (OSError, ProcessLookupError, psutil.NoSuchProcess):
+                        # Process is dead, clean up stale PID file
+                        try:
+                            os.remove(pid_file)
+                        except:
+                            pass
+                except (ValueError, IOError):
+                    pass
+            
+            return False
+            
+        except Exception:
             return False
     
     def _try_file_lock(self):
@@ -430,50 +505,33 @@ class SingleInstanceLock:
             print(f"Debug: Failed to set up process group: {e}")
 
     def _cleanup_stale_processes(self):
-        """Clean up any stale processes that might interfere"""
+        """Clean up only truly stale/zombie processes that might interfere"""
         try:
             import psutil
             current_pid = os.getpid()
             
-            # Find processes with our app name or related ffmpeg processes
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'ppid']):
+            # Only clean up zombie/dead processes, not running ones
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'status']):
                 try:
                     if proc.info['pid'] == current_pid:
                         continue
                         
-                    # Check if it's our app, ffmpeg, or child processes
-                    cmdline = proc.info.get('cmdline', [])
-                    proc_name = proc.info.get('name', '').lower()
-                    
-                    # Look for our app processes
-                    is_our_app = any(self.app_name.lower() in str(arg).lower() for arg in cmdline)
-                    
-                    # Look for ffmpeg processes that might be orphaned
-                    is_ffmpeg = proc_name == 'ffmpeg' or 'ffmpeg' in str(cmdline)
-                    
-                    if is_our_app or is_ffmpeg:
-                        # Check if process is truly dead/zombie or orphaned
-                        try:
-                            status = proc.status()
-                            if status in [psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD]:
+                    # Only target zombie or dead processes
+                    status = proc.info.get('status')
+                    if status in [psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD]:
+                        # Check if it's related to our app
+                        cmdline = proc.info.get('cmdline', [])
+                        is_our_app = any(self.app_name.lower() in str(arg).lower() for arg in cmdline)
+                        
+                        if is_our_app:
+                            print(f"Debug: Cleaning up zombie process {proc.info['pid']}")
+                            try:
                                 proc.terminate()
                                 proc.wait(timeout=1)
-                            elif is_ffmpeg:
-                                # For ffmpeg processes, check if parent is still alive
-                                try:
-                                    parent = proc.parent()
-                                    if parent is None or not parent.is_running():
-                                        # Orphaned ffmpeg process
-                                        proc.terminate()
-                                        proc.wait(timeout=2)
-                                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                    # Parent doesn't exist, terminate orphaned process
-                                    proc.terminate()
-                                    proc.wait(timeout=2)
-                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
-                            continue
-                            
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                                pass
+                                
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
                     
         except ImportError:
@@ -483,12 +541,11 @@ class SingleInstanceLock:
             print(f"Debug: Error cleaning up stale processes: {e}")
     
     def _basic_process_cleanup(self):
-        """Basic process cleanup without psutil"""
+        """Basic process cleanup without psutil - minimalistic approach"""
         try:
-            if platform.system() == "Darwin":
-                # Use pkill to clean up processes on macOS
-                subprocess.run(['pkill', '-f', self.app_name], capture_output=True)
-                subprocess.run(['pkill', '-f', 'ffmpeg.*whisper'], capture_output=True)
+            # Don't use pkill as it can kill legitimate processes
+            # Only clean up what we can safely identify as ours
+            print("Debug: Skipping aggressive process cleanup to prevent interference")
         except Exception:
             pass
     
@@ -547,6 +604,9 @@ class WhisperGUI:
         
         # Initialize global process manager
         self.process_manager = ProcessManager()
+        
+        # Start process monitoring (once per application)
+        self.process_manager.start_monitoring()
         
         # Set up process monitoring
         self._setup_process_monitoring()
@@ -685,19 +745,19 @@ class WhisperGUI:
         
         # Configure grid weights
         minutes_frame.columnconfigure(0, weight=1)
-        minutes_frame.rowconfigure(2, weight=1)
+        minutes_frame.rowconfigure(3, weight=1)
         
         # Instructions
         instructions = ttk.Label(minutes_frame, 
-            text="Generate meeting minutes from transcription using AI assistance",
+            text="Generate meeting minutes from transcription using CIRCUIT API",
             font=('TkDefaultFont', 10))
         instructions.grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
         
-        # Generate button
+        # Generate button frame
         generate_frame = ttk.Frame(minutes_frame)
-        generate_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        generate_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
         
-        self.generate_minutes_btn = ttk.Button(generate_frame, text="🤖 Generate Minutes", 
+        self.generate_minutes_btn = ttk.Button(generate_frame, text="🤖 Generate Minutes with CIRCUIT", 
                                              command=self.generate_minutes, state=tk.DISABLED)
         self.generate_minutes_btn.pack(side=tk.LEFT)
         
@@ -705,19 +765,25 @@ class WhisperGUI:
         self.minutes_progress = ttk.Progressbar(generate_frame, mode='indeterminate')
         self.minutes_progress.pack(side=tk.LEFT, padx=(10, 0), fill=tk.X, expand=True)
         
+        # Status label for minutes generation (separate row)
+        self.minutes_status = ttk.Label(minutes_frame, text="Ready to generate minutes", foreground='gray')
+        self.minutes_status.grid(row=2, column=0, sticky=tk.W, pady=(0, 10))
+        
         # Minutes text area
         self.minutes_text = scrolledtext.ScrolledText(minutes_frame, wrap=tk.WORD, height=20)
-        self.minutes_text.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        self.minutes_text.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         
         # Save minutes button
         save_minutes_frame = ttk.Frame(minutes_frame)
-        save_minutes_frame.grid(row=3, column=0, sticky=(tk.W, tk.E))
+        save_minutes_frame.grid(row=4, column=0, sticky=(tk.W, tk.E))
         
-        ttk.Button(save_minutes_frame, text="💾 Save Minutes", 
-                  command=self.save_minutes).pack(side=tk.LEFT)
+        self.save_minutes_btn = ttk.Button(save_minutes_frame, text="💾 Save Minutes", 
+                                          command=self.save_minutes, state=tk.DISABLED)
+        self.save_minutes_btn.pack(side=tk.LEFT)
         
-        ttk.Button(save_minutes_frame, text="📋 Copy Minutes", 
-                  command=self.copy_minutes).pack(side=tk.LEFT, padx=(10, 0))
+        self.copy_minutes_btn = ttk.Button(save_minutes_frame, text="📋 Copy Minutes", 
+                                          command=self.copy_minutes, state=tk.DISABLED)
+        self.copy_minutes_btn.pack(side=tk.LEFT, padx=(10, 0))
     
     def create_settings_tab(self):
         # Settings frame
@@ -727,41 +793,72 @@ class WhisperGUI:
         # Configure grid weights
         settings_frame.columnconfigure(1, weight=1)
         
-        # Claude API Settings
-        api_group = ttk.LabelFrame(settings_frame, text="Claude API Configuration", padding="10")
+        # CIRCUIT API Settings
+        api_group = ttk.LabelFrame(settings_frame, text="CIRCUIT API Configuration", padding="10")
         api_group.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 20))
         api_group.columnconfigure(1, weight=1)
         
-        ttk.Label(api_group, text="API Endpoint:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
-        self.api_endpoint_var = tk.StringVar(value="https://api.anthropic.com/v1/messages")
-        api_endpoint_entry = ttk.Entry(api_group, textvariable=self.api_endpoint_var, width=50)
-        api_endpoint_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=(0, 5))
+        # Client ID
+        ttk.Label(api_group, text="Client ID:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        self.client_id_var = tk.StringVar()
+        self.client_id_entry = ttk.Entry(api_group, textvariable=self.client_id_var, width=50)
+        self.client_id_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=(0, 5))
         
-        ttk.Label(api_group, text="API Key:").grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
-        self.api_key_var = tk.StringVar()
-        api_key_entry = ttk.Entry(api_group, textvariable=self.api_key_var, show="*", width=50)
-        api_key_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(0, 5))
+        # Client Secret
+        ttk.Label(api_group, text="Client Secret:").grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
+        self.client_secret_var = tk.StringVar()
+        self.client_secret_entry = ttk.Entry(api_group, textvariable=self.client_secret_var, show="*", width=50)
+        self.client_secret_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(0, 5))
         
-        # Test API button
+        # App Key
+        ttk.Label(api_group, text="App Key:").grid(row=2, column=0, sticky=tk.W, pady=(0, 5))
+        self.app_key_var = tk.StringVar()
+        self.app_key_entry = ttk.Entry(api_group, textvariable=self.app_key_var, width=50)
+        self.app_key_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=(0, 5))
+        
+        # Model selection for CIRCUIT API
+        ttk.Label(api_group, text="Model:").grid(row=3, column=0, sticky=tk.W, pady=(0, 5))
+        self.circuit_model_var = tk.StringVar(value="gpt-4o-mini")
+        model_combo = ttk.Combobox(api_group, textvariable=self.circuit_model_var, 
+                                  values=[
+                                      "gpt-4o",
+                                      "gpt-4o-mini", 
+                                      "gpt-4.1",
+                                      "o4-mini",
+                                      "o3",
+                                      "gemini-2.5-flash",
+                                      "gemini-2.5-pro"
+                                  ], state="readonly")
+        model_combo.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=(0, 5))
+        
+        # Language selection for minutes
+        ttk.Label(api_group, text="Minutes Language:").grid(row=4, column=0, sticky=tk.W, pady=(0, 5))
+        self.minutes_language_var = tk.StringVar(value="Auto (from transcript)")
+        language_combo = ttk.Combobox(api_group, textvariable=self.minutes_language_var, 
+                                    values=["Auto (from transcript)", "English", "Japanese", "Chinese", "Spanish", "French", "German", "Korean"], state="readonly")
+        language_combo.grid(row=4, column=1, sticky=(tk.W, tk.E), pady=(0, 5))
+        
+        # Test connection button
         ttk.Button(api_group, text="🔍 Test Connection", 
-                  command=self.test_api_connection).grid(row=2, column=0, columnspan=2, pady=(10, 0))
+                  command=self.test_circuit_connection).grid(row=5, column=0, columnspan=2, pady=(10, 0))
         
         # Minutes Prompt Settings
-        prompt_group = ttk.LabelFrame(settings_frame, text="Meeting Minutes Prompts", padding="10")
+        prompt_group = ttk.LabelFrame(settings_frame, text="Meeting Minutes Template", padding="10")
         prompt_group.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 20))
         prompt_group.columnconfigure(0, weight=1)
         prompt_group.rowconfigure(1, weight=1)
         
-        ttk.Label(prompt_group, text="Minutes Generation Prompt:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        ttk.Label(prompt_group, text="Minutes Generation Template:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
         
         self.minutes_prompt_var = tk.StringVar(value="""Please create professional meeting minutes from the following transcript. Include:
 
 1. **Meeting Summary**: Brief overview of the main topics discussed
-2. **Key Decisions**: Important decisions made during the meeting
+2. **Key Decisions**: Important decisions made during the meeting  
 3. **Action Items**: Tasks assigned with responsible parties (if mentioned)
 4. **Next Steps**: Planned follow-up actions or next meetings
 
 Format the output in clear, professional language suitable for business documentation.
+Language: Generate the minutes in {language}.
 
 Transcript:
 {transcript}""")
@@ -773,6 +870,9 @@ Transcript:
         # Save settings button
         ttk.Button(settings_frame, text="💾 Save Settings", 
                   command=self.save_settings).grid(row=2, column=0, columnspan=2, pady=(10, 0))
+        
+        # Load saved settings
+        self.load_settings()
         
     def browse_file(self):
         """Open file browser to select audio file"""
@@ -952,10 +1052,9 @@ Transcript:
     def transcribe_audio(self):
         """Perform audio transcription using MLX Whisper"""
         try:
-            # First, aggressively clean up any existing ffmpeg processes
-            print("Debug: Cleaning up existing ffmpeg processes before transcription")
-            self.process_manager.kill_ffmpeg_processes()
-            time.sleep(1)  # Give processes time to die
+            # Set transcription state to prevent ffmpeg cleanup during processing
+            self.process_manager._transcribing = True
+            print("Debug: Started transcription - ffmpeg cleanup disabled")
             
             model_name = self.model_var.get()
             language = self.language_var.get() if self.language_var.get() != "auto" else None
@@ -973,7 +1072,6 @@ Transcript:
             self.root.after(0, lambda: self.status_var.set("Transcribing audio with MLX..."))
             
             # Simulate progress during transcription
-            import time
             start_time = time.time()
             self.transcription_start_time = start_time
             
@@ -1054,9 +1152,10 @@ Transcript:
             self.root.after(0, lambda: self.show_error(error_msg))
         
         finally:
-            # Clean up any remaining ffmpeg processes
-            print("Debug: Final cleanup of ffmpeg processes after transcription")
-            self.process_manager.kill_ffmpeg_processes()
+            # Re-enable ffmpeg cleanup and clean up any remaining processes
+            self.process_manager._transcribing = False
+            print("Debug: Transcription finished - re-enabling ffmpeg cleanup")
+            self.process_manager.kill_ffmpeg_processes(force=True)
             
             # Re-enable UI
             self.root.after(0, self.transcription_complete)
@@ -1093,8 +1192,9 @@ Transcript:
         self.progress_bar.config(mode="determinate")
         self.progress_var.set(100)
         
-        # Enable meeting minutes button if transcript exists
-        if hasattr(self, 'result_text') and self.result_text.get(1.0, tk.END).strip():
+        # Enable meeting minutes button if transcript exists and CIRCUIT credentials are configured
+        if (hasattr(self, 'result_text') and self.result_text.get(1.0, tk.END).strip() and 
+            self.circuit_credentials_configured()):
             self.generate_minutes_btn.config(state="normal")
         
         # Calculate actual processing time
@@ -1207,7 +1307,6 @@ Transcript:
     def process_batch_files(self):
         """Process multiple files in batch"""
         try:
-            import time
             batch_start_time = time.time()
             total_files = len(self.batch_files)
             all_transcripts = []
@@ -1239,9 +1338,9 @@ Transcript:
                 self.root.after(0, lambda f=filename: self.status_var.set(f"Processing {f}..."))
                 
                 try:
-                    # Clean up ffmpeg processes before each transcription
-                    print(f"Debug: Cleaning ffmpeg for batch file {current_file + 1}/{total_files}")
-                    self.process_manager.kill_ffmpeg_processes()
+                    # Set transcription state for this batch file
+                    self.process_manager._transcribing = True
+                    print(f"Debug: Starting batch transcription for file {current_file + 1}/{total_files}")
                     time.sleep(0.5)  # Brief pause between files
                     
                     # Transcribe current file using MLX large-v3
@@ -1264,7 +1363,8 @@ Transcript:
                             language=language
                         )
                     finally:
-                        # Restore environment
+                        # Restore environment and reset transcription state
+                        self.process_manager._transcribing = False
                         for key, value in old_env.items():
                             if value is None:
                                 os.environ.pop(key, None)
@@ -1291,6 +1391,9 @@ Transcript:
             self.root.after(0, lambda: self.show_error(error_msg))
         
         finally:
+            # Reset transcription state and cleanup
+            self.process_manager._transcribing = False
+            self.process_manager.kill_ffmpeg_processes(force=True)
             # Re-enable UI
             self.root.after(0, self.batch_processing_complete)
     
@@ -1386,16 +1489,50 @@ Transcript:
 
     def on_closing(self):
         """Handle window closing event"""
-        print("Debug: Application closing, performing comprehensive cleanup")
+        print("Debug: Application closing, performing quick cleanup")
         
-        # Use enhanced process manager for thorough cleanup
-        self.process_manager.cleanup_all()
+        # Immediately disable monitoring to prevent interference
+        if hasattr(self.process_manager, 'monitoring_enabled'):
+            self.process_manager.monitoring_enabled = False
         
-        # Release instance lock
-        self.instance_lock.release_lock()
+        # Set transcription to false to allow cleanup
+        if hasattr(self.process_manager, '_transcribing'):
+            self.process_manager._transcribing = False
         
-        # Destroy GUI
-        self.root.destroy()
+        # First, destroy the GUI immediately
+        try:
+            self.root.quit()  # Exit mainloop immediately
+        except:
+            pass
+        
+        # Then do cleanup in background thread to avoid blocking
+        def cleanup_in_background():
+            try:
+                # Quick cleanup only
+                self.process_manager.cleanup_all()
+                self.instance_lock.release_lock()
+            except Exception as e:
+                print(f"Debug: Background cleanup error: {e}")
+            finally:
+                # Force exit regardless
+                import os
+                os._exit(0)
+        
+        # Start cleanup in background
+        threading.Thread(target=cleanup_in_background, daemon=True).start()
+        
+        # Don't wait for cleanup - exit immediately
+        try:
+            self.root.destroy()  # Destroy window
+        except:
+            pass
+        
+        # Force exit after short delay
+        def force_exit():
+            import os
+            os._exit(0)
+        
+        self.root.after(1000, force_exit)  # Force exit after 1 second max
     
     def bring_to_front(self):
         """Bring the application window to front"""
@@ -1417,8 +1554,63 @@ Transcript:
         except Exception:
             pass
     
+    def circuit_credentials_configured(self):
+        """Check if CIRCUIT API credentials are configured"""
+        return (self.client_id_var.get().strip() and 
+                self.client_secret_var.get().strip() and 
+                self.app_key_var.get().strip())
+    
+    def test_circuit_connection(self):
+        """Test CIRCUIT API connection"""
+        if not self.circuit_credentials_configured():
+            messagebox.showerror("Error", "Please configure all CIRCUIT API credentials first")
+            return
+        
+        def test_in_thread():
+            try:
+                # Get access token
+                token = self.get_circuit_token()
+                if token:
+                    status_msg = "✅ CIRCUIT API connection successful"
+                    self.root.after(0, lambda: messagebox.showinfo("Success", status_msg))
+                else:
+                    status_msg = "❌ Failed to authenticate with CIRCUIT API"
+                    self.root.after(0, lambda: messagebox.showerror("Error", status_msg))
+            except Exception as e:
+                error_msg = f"❌ Connection failed: {str(e)}"
+                self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+        
+        threading.Thread(target=test_in_thread, daemon=True).start()
+    
+    def get_circuit_token(self):
+        """Get OAuth2 access token from CIRCUIT API"""
+        import requests
+        import base64
+        
+        client_id = self.client_id_var.get().strip()
+        client_secret = self.client_secret_var.get().strip()
+        
+        # Encode credentials
+        credentials = base64.b64encode(f'{client_id}:{client_secret}'.encode('utf-8')).decode('utf-8')
+        
+        url = "https://id.cisco.com/oauth2/default/v1/token"
+        headers = {
+            "Accept": "*/*",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {credentials}"
+        }
+        data = "grant_type=client_credentials"
+        
+        try:
+            response = requests.post(url, headers=headers, data=data, timeout=30)
+            response.raise_for_status()
+            token_data = response.json()
+            return token_data.get('access_token')
+        except Exception:
+            return None
+    
     def generate_minutes(self):
-        """Generate meeting minutes from transcript using Claude API"""
+        """Generate meeting minutes from transcript using CIRCUIT API"""
         if not hasattr(self, 'result_text'):
             messagebox.showerror("Error", "No transcript available for minutes generation")
             return
@@ -1428,73 +1620,126 @@ Transcript:
             messagebox.showerror("Error", "Transcript is empty")
             return
         
-        # Get settings
-        api_endpoint = self.api_endpoint_var.get() or "https://api.anthropic.com/v1/messages"
-        api_key = self.api_key_var.get()
-        custom_prompt = self.prompt_text.get(1.0, tk.END).strip()
-        
-        if not api_key:
-            messagebox.showerror("Error", "Please configure Claude API key in Settings tab")
+        # Check if CIRCUIT credentials are configured
+        if not self.circuit_credentials_configured():
+            messagebox.showerror("Error", "CIRCUIT API credentials not configured. Please check Settings tab.")
             return
         
         # Disable button and show progress
         self.generate_minutes_btn.config(state="disabled")
         self.minutes_progress.start()
-        self.minutes_status.config(text="Generating meeting minutes...")
+        self.minutes_status.config(text="Generating meeting minutes with CIRCUIT API...")
         
         def generate_in_thread():
             try:
-                import requests
-                import json
+                # Get access token
+                token = self.get_circuit_token()
+                if not token:
+                    error_msg = "Failed to authenticate with CIRCUIT API"
+                    self.root.after(0, lambda: self.show_minutes_error(error_msg))
+                    return
                 
-                # Use custom prompt or default
-                if custom_prompt:
-                    prompt = custom_prompt.replace("{transcript}", transcript)
+                # Get custom prompt template and selected language
+                custom_prompt = self.minutes_prompt_text.get(1.0, tk.END).strip()
+                selected_language = self.minutes_language_var.get()
+                
+                # Determine output language
+                if selected_language == "Auto (from transcript)":
+                    # Try to detect language from transcript (simple detection)
+                    language_instruction = "the same language as the transcript"
                 else:
-                    prompt = f"""Please analyze the following transcript and create comprehensive meeting minutes:
+                    language_instruction = selected_language
+                
+                # Replace placeholders with actual values
+                if custom_prompt and "{transcript}" in custom_prompt:
+                    prompt = custom_prompt.replace("{transcript}", transcript).replace("{language}", language_instruction)
+                else:
+                    prompt = f"""Please create professional meeting minutes from the following transcript. Include:
 
-{transcript}
+1. **Meeting Summary**: Brief overview of the main topics discussed
+2. **Key Decisions**: Important decisions made during the meeting
+3. **Action Items**: Tasks assigned with responsible parties (if mentioned)
+4. **Next Steps**: Planned follow-up actions or next meetings
 
-Please format the output as professional meeting minutes including:
-1. Meeting summary
-2. Key discussion points
-3. Decisions made
-4. Action items (if any)
-5. Next steps (if mentioned)
+Format the output in clear, professional language suitable for business documentation.
 
-Format in clear, professional language suitable for business documentation."""
+Transcript:
+{transcript}"""
                 
-                # API request
-                headers = {
-                    "Content-Type": "application/json",
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01"
-                }
-                
-                data = {
-                    "model": "claude-3-sonnet-20240229",
-                    "max_tokens": 4000,
-                    "messages": [{
-                        "role": "user",
-                        "content": prompt
-                    }]
-                }
-                
-                response = requests.post(api_endpoint, headers=headers, json=data, timeout=60)
-                response.raise_for_status()
-                
-                result = response.json()
-                minutes_text = result["content"][0]["text"]
-                
-                # Update UI in main thread
-                self.root.after(0, lambda: self.display_minutes(minutes_text))
-                
+                # Call CIRCUIT API
+                minutes_text = self.call_circuit_api(token, prompt)
+                if minutes_text:
+                    # Display the generated minutes
+                    self.root.after(0, lambda: self.display_minutes(minutes_text))
+                else:
+                    error_msg = "Failed to generate minutes using CIRCUIT API"
+                    self.root.after(0, lambda: self.show_minutes_error(error_msg))
+                    
             except Exception as e:
                 error_msg = f"Error generating minutes: {str(e)}"
                 self.root.after(0, lambda: self.show_minutes_error(error_msg))
         
         # Start generation in background thread
         threading.Thread(target=generate_in_thread, daemon=True).start()
+    
+    def call_circuit_api(self, token, prompt):
+        """Call CIRCUIT API to generate meeting minutes"""
+        import requests
+        
+        model = self.circuit_model_var.get()
+        app_key = self.app_key_var.get().strip()
+        
+        url = f"https://chat-ai.cisco.com/openai/deployments/{model}/chat/completions"
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "api-key": token
+        }
+        
+        # Get language setting for system prompt
+        selected_language = self.minutes_language_var.get()
+        if selected_language == "Auto (from transcript)":
+            system_prompt = "You are a professional assistant that creates high-quality meeting minutes from transcripts. Generate the minutes in the same language as the input transcript."
+        else:
+            system_prompt = f"You are a professional assistant that creates high-quality meeting minutes from transcripts. Generate the minutes in {selected_language}."
+        
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "user": f'{{"appkey": "{app_key}"}}',
+            "stop": ["<|im_end|>"]
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            
+            result = response.json()
+            if 'choices' in result and len(result['choices']) > 0:
+                return result['choices'][0]['message']['content']
+            else:
+                print(f"Debug: Unexpected API response format: {result}")
+                return None
+                
+        except requests.exceptions.HTTPError as e:
+            print(f"Debug: HTTP error {response.status_code}: {response.text}")
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"Debug: Request error: {str(e)}")
+            return None
+        except Exception as e:
+            print(f"Debug: Unexpected error in CIRCUIT API call: {str(e)}")
+            return None
+    
     
     def display_minutes(self, minutes_text):
         """Display generated meeting minutes"""
@@ -1506,7 +1751,7 @@ Format in clear, professional language suitable for business documentation."""
         self.save_minutes_btn.config(state="normal")
         self.copy_minutes_btn.config(state="normal")
         self.minutes_progress.stop()
-        self.minutes_status.config(text="Meeting minutes generated successfully")
+        self.minutes_status.config(text="Meeting minutes generated successfully with CIRCUIT API")
     
     def show_minutes_error(self, error_msg):
         """Show error during minutes generation"""
@@ -1514,45 +1759,6 @@ Format in clear, professional language suitable for business documentation."""
         self.generate_minutes_btn.config(state="normal")
         self.minutes_progress.stop()
         self.minutes_status.config(text="Error occurred during minutes generation")
-    
-    def test_api_connection(self):
-        """Test Claude API connection"""
-        api_endpoint = self.api_endpoint_var.get() or "https://api.anthropic.com/v1/messages"
-        api_key = self.api_key_var.get()
-        
-        if not api_key:
-            messagebox.showerror("Error", "Please enter API key first")
-            return
-        
-        def test_in_thread():
-            try:
-                import requests
-                
-                headers = {
-                    "Content-Type": "application/json",
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01"
-                }
-                
-                data = {
-                    "model": "claude-3-sonnet-20240229",
-                    "max_tokens": 100,
-                    "messages": [{
-                        "role": "user",
-                        "content": "Hello, this is a test message. Please respond with 'API connection successful'."
-                    }]
-                }
-                
-                response = requests.post(api_endpoint, headers=headers, json=data, timeout=30)
-                response.raise_for_status()
-                
-                self.root.after(0, lambda: messagebox.showinfo("Success", "API connection test successful!"))
-                
-            except Exception as e:
-                error_msg = f"API connection failed: {str(e)}"
-                self.root.after(0, lambda: messagebox.showerror("Connection Error", error_msg))
-        
-        threading.Thread(target=test_in_thread, daemon=True).start()
     
     def save_minutes(self):
         """Save meeting minutes to file"""
@@ -1593,15 +1799,18 @@ Format in clear, professional language suitable for business documentation."""
         messagebox.showinfo("Success", "Meeting minutes copied to clipboard")
     
     def save_settings(self):
-        """Save Claude API settings"""
+        """Save CIRCUIT API settings"""
         settings = {
-            "api_endpoint": self.api_endpoint_var.get(),
-            "api_key": self.api_key_var.get(),
-            "custom_prompt": self.prompt_text.get(1.0, tk.END).strip()
+            "client_id": self.client_id_var.get().strip(),
+            "client_secret": self.client_secret_var.get().strip(),
+            "app_key": self.app_key_var.get().strip(),
+            "circuit_model": self.circuit_model_var.get(),
+            "minutes_language": self.minutes_language_var.get(),
+            "minutes_template": self.minutes_prompt_text.get(1.0, tk.END).strip()
         }
         
         try:
-            settings_file = os.path.expanduser("~/.mlx_whisper_settings.json")
+            settings_file = os.path.expanduser("~/.mlx_whisper_circuit_settings.json")
             with open(settings_file, 'w') as f:
                 json.dump(settings, f, indent=2)
             messagebox.showinfo("Success", "Settings saved successfully")
@@ -1609,20 +1818,25 @@ Format in clear, professional language suitable for business documentation."""
             messagebox.showerror("Error", f"Failed to save settings: {str(e)}")
     
     def load_settings(self):
-        """Load saved Claude API settings"""
+        """Load saved CIRCUIT API settings"""
         try:
-            settings_file = os.path.expanduser("~/.mlx_whisper_settings.json")
+            settings_file = os.path.expanduser("~/.mlx_whisper_circuit_settings.json")
             if os.path.exists(settings_file):
                 with open(settings_file, 'r') as f:
                     settings = json.load(f)
                 
-                self.api_endpoint_var.set(settings.get("api_endpoint", ""))
-                self.api_key_var.set(settings.get("api_key", ""))
+                # Load API credentials
+                self.client_id_var.set(settings.get("client_id", ""))
+                self.client_secret_var.set(settings.get("client_secret", ""))
+                self.app_key_var.set(settings.get("app_key", ""))
+                self.circuit_model_var.set(settings.get("circuit_model", "gpt-4o-mini"))
+                self.minutes_language_var.set(settings.get("minutes_language", "Auto (from transcript)"))
                 
-                custom_prompt = settings.get("custom_prompt", "")
-                if custom_prompt:
-                    self.prompt_text.delete(1.0, tk.END)
-                    self.prompt_text.insert(tk.END, custom_prompt)
+                # Load minutes template
+                minutes_template = settings.get("minutes_template", "")
+                if minutes_template and hasattr(self, 'minutes_prompt_text'):
+                    self.minutes_prompt_text.delete(1.0, tk.END)
+                    self.minutes_prompt_text.insert(tk.END, minutes_template)
                     
         except Exception as e:
             # Silently ignore settings loading errors
@@ -1635,21 +1849,26 @@ Format in clear, professional language suitable for business documentation."""
             # Try to bring existing instance to front
             self._try_focus_existing_instance()
             
-            # Show user-friendly message
-            response = messagebox.askquestion(
-                "MLX Whisper GUI Already Running", 
-                "MLX Whisper GUI is already running.\n\n"
-                "Only one instance can run at a time for optimal performance.\n\n"
-                "Would you like to close this window and use the existing instance?",
-                icon='info'
-            )
-            
-            if response == 'yes':
-                self.root.destroy()
-                return False
-            else:
-                # User chose to keep trying, destroy current instance anyway
-                self.root.destroy()
+            # For GUI applications, we should always prevent double launch
+            # Don't show the dialog for .app bundles as it can be confusing
+            try:
+                # Just inform briefly and exit
+                self.root.withdraw()  # Hide the window immediately
+                messagebox.showinfo(
+                    "MLX Whisper GUI", 
+                    "MLX Whisper GUI is already running.\n\n"
+                    "The existing window has been brought to the front.",
+                    icon='info'
+                )
+            except:
+                pass
+            finally:
+                # Always exit if another instance is running
+                try:
+                    self.root.quit()
+                    self.root.destroy()
+                except:
+                    pass
                 return False
         
         try:
@@ -1665,11 +1884,30 @@ Format in clear, professional language suitable for business documentation."""
         """Try to focus the existing instance"""
         try:
             if platform.system() == "Darwin":
-                # Try to activate the existing MLX Whisper GUI process
-                subprocess.run([
-                    'osascript', '-e',
-                    'tell application "System Events" to tell process "MLXWhisperGUI" to set frontmost to true'
-                ], capture_output=True, timeout=2)
+                # First try with the bundle identifier
+                try:
+                    subprocess.run([
+                        'osascript', '-e',
+                        'tell application "MLXWhisperGUI" to activate'
+                    ], capture_output=True, timeout=2)
+                except:
+                    # Fallback: try with process name
+                    try:
+                        subprocess.run([
+                            'osascript', '-e',
+                            'tell application "System Events" to tell process "MLXWhisperGUI" to set frontmost to true'
+                        ], capture_output=True, timeout=2)
+                    except:
+                        # Final fallback: try to find and activate any MLX Whisper window
+                        subprocess.run([
+                            'osascript', '-e',
+                            '''tell application "System Events"
+                                set procs to every process whose name contains "MLX" or name contains "Whisper"
+                                if length of procs > 0 then
+                                    set frontmost of item 1 of procs to true
+                                end if
+                            end tell'''
+                        ], capture_output=True, timeout=2)
         except Exception:
             pass
 
