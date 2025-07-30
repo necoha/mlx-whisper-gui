@@ -6,9 +6,24 @@
 
 ## English
 
-A sophisticated graphical interface for MLX Whisper transcription on Apple Silicon Macs with advanced progress tracking and ETA estimation.
+A sophisticated graphical interface for MLX Whisper transcription on Apple Silicon Macs with advanced progress tracking, ETA estimation, and AI-powered meeting minutes generation.
 
 ## Features
+
+### Enhanced Process Management
+- **ProcessManager**: Manages ffmpeg processes and ensures proper cleanup of stale processes.
+
+### Single Instance Lock
+- **SingleInstanceLock**: Prevents multiple instances of the application from running simultaneously.
+
+### Audio Transcription
+- **Transcription**: Select audio files and transcribe them using the MLX Whisper model.
+
+### Batch Processing
+- **Batch Processing**: Process multiple audio files simultaneously for efficiency.
+
+### Settings Management
+- **Configuration**: Save and load CIRCUIT API settings for seamless integration.
 
 ### Core Functionality
 - **High Accuracy**: Uses MLX Whisper large-v3 model for optimal transcription quality
@@ -70,6 +85,20 @@ python whisper_gui.py
 ## Usage
 
 ### Basic Transcription
+1. **Select File**: Click "Browse" or drag audio file to select.
+2. **Choose Settings**: Select language (auto-detect recommended).
+3. **Start Processing**: Click "Transcribe" to begin.
+4. **Monitor Progress**: Watch real-time progress with ETA.
+5. **Review Results**: Transcript appears automatically when complete.
+
+### Batch Processing
+1. Click "🗋 Batch" button.
+2. Select multiple audio files.
+3. Confirm processing in dialog.
+4. Monitor batch progress with file-by-file ETA.
+5. All transcripts saved automatically.
+
+### Basic Transcription
 1. **Select File**: Click "Browse" or drag audio file to select
 2. **Choose Settings**: Select language (auto-detect recommended)
 3. **Start Processing**: Click "Transcribe" to begin
@@ -100,6 +129,15 @@ python whisper_gui.py
 - **Streaming**: WebM, FLV
 
 ## Technical Details
+
+### Process Management
+- The application uses a **ProcessManager** class to manage ffmpeg processes, ensuring that stale processes are cleaned up effectively.
+
+### Single Instance Lock
+- A **SingleInstanceLock** class is implemented to prevent multiple instances of the application from running at the same time, ensuring that only one instance can access the resources.
+
+### Audio Processing
+- The application leverages the MLX Whisper model for high-quality audio transcription, supporting various audio formats.
 
 ### MLX Optimization
 - Utilizes Apple's MLX framework for maximum Apple Silicon performance
