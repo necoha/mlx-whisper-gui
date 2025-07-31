@@ -301,32 +301,63 @@ class SingleInstanceLock:
                 pid_dir = tempfile.gettempdir()
             
             pid_file = os.path.join(pid_dir, f"{self.app_name}.pid")
+            current_pid = os.getpid()
             
             if os.path.exists(pid_file):
                 try:
                     with open(pid_file, 'r') as f:
-                        pid = int(f.read().strip())
+                        content = f.read().strip()
+                        lines = content.split('\n')
+                        stored_pid = int(lines[0])
                     
-                    # Check if process is still running
+                    # Always check if this is the same process first
+                    if stored_pid == current_pid:
+                        print(f"Debug: PID file contains current process {current_pid}, clearing stale file")
+                        try:
+                            os.remove(pid_file)  # Remove stale self-reference
+                        except:
+                            pass
+                        return False  # This is the same process
+                    
+                    # Check if the stored process is still running
                     try:
-                        os.kill(pid, 0)  # Signal 0 just checks if process exists
-                        # Process exists, check if it's our application
+                        os.kill(stored_pid, 0)  # Signal 0 just checks if process exists
+                        # Process exists, verify it's our application
                         import psutil
-                        proc = psutil.Process(pid)
-                        if 'MLXWhisperGUI' in proc.name() or 'whisper' in proc.name().lower():
+                        proc = psutil.Process(stored_pid)
+                        proc_name = proc.name().lower()
+                        if 'mlxwhispergui' in proc_name or 'whisper' in proc_name:
+                            print(f"Debug: Found existing MLXWhisperGUI process {stored_pid} (current: {current_pid})")
                             return True
+                        else:
+                            # Process exists but it's not our app - remove stale PID file
+                            print(f"Debug: PID {stored_pid} exists but is not MLXWhisperGUI ({proc_name}), removing stale PID file")
+                            try:
+                                os.remove(pid_file)
+                            except:
+                                pass
+                            return False
                     except (OSError, ProcessLookupError, psutil.NoSuchProcess):
                         # Process is dead, clean up stale PID file
                         try:
                             os.remove(pid_file)
+                            print(f"Debug: Removed stale PID file for dead process {stored_pid}")
                         except:
                             pass
-                except (ValueError, IOError):
-                    pass
+                        return False
+                except (ValueError, IOError, IndexError):
+                    # Invalid PID file, remove it
+                    try:
+                        os.remove(pid_file)
+                        print("Debug: Removed invalid PID file")
+                    except:
+                        pass
+                    return False
             
             return False
             
-        except Exception:
+        except Exception as e:
+            print(f"Debug: Exception in _check_existing_instance: {e}")
             return False
     
     def _try_file_lock(self):
@@ -402,11 +433,16 @@ class SingleInstanceLock:
             if os.path.exists(self.pid_file_path):
                 try:
                     with open(self.pid_file_path, 'r') as f:
-                        old_pid = int(f.read().strip())
+                        content = f.read().strip()
+                        lines = content.split('\n')
+                        old_pid = int(lines[0])
                     
                     # Check if process is still running
                     try:
                         os.kill(old_pid, 0)  # Signal 0 just checks if process exists
+                        # If process exists, check if it's transcribing (give it more leniency)
+                        if len(lines) >= 3 and "TRANSCRIBING" in lines[2]:
+                            print(f"Debug: Found active transcription process {old_pid}, avoiding interference")
                         return False  # Process is still running
                     except (OSError, ProcessLookupError):
                         # Process is dead, remove stale PID file
@@ -475,7 +511,11 @@ class SingleInstanceLock:
     def is_another_instance_running(self):
         """Check if another instance is already running"""
         try:
-            # Quick check using socket
+            # First check PID file method which is more reliable
+            if self._check_existing_instance():
+                return True
+            
+            # Quick check using socket as backup
             test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             test_socket.settimeout(0.5)
             
@@ -484,6 +524,7 @@ class SingleInstanceLock:
                     result = test_socket.connect_ex(('127.0.0.1', port))
                     if result == 0:
                         test_socket.close()
+                        print(f"Debug: Found socket lock on port {port}")
                         return True
                 except:
                     continue
@@ -491,7 +532,8 @@ class SingleInstanceLock:
             test_socket.close()
             return False
             
-        except:
+        except Exception as e:
+            print(f"Debug: Exception in is_another_instance_running: {e}")
             return False
     
     def _setup_process_group(self):
@@ -602,6 +644,9 @@ class WhisperGUI:
         # Initialize single instance lock
         self.instance_lock = SingleInstanceLock()
         
+        # Clean up any stale PID files from previous instances
+        self._cleanup_stale_pid_files()
+        
         # Initialize global process manager
         self.process_manager = ProcessManager()
         
@@ -634,14 +679,18 @@ class WhisperGUI:
             "auto": "Auto-detect",
             "en": "English",
             "ja": "Japanese",
+            "ko": "Korean",
+            "zh": "Chinese",
             "es": "Spanish",
             "fr": "French",
             "de": "German",
             "it": "Italian",
             "pt": "Portuguese",
             "ru": "Russian",
-            "ko": "Korean",
-            "zh": "Chinese"
+            "ar": "Arabic",
+            "hi": "Hindi",
+            "th": "Thai",
+            "vi": "Vietnamese"
         }
         
         self.create_widgets()
@@ -745,7 +794,7 @@ class WhisperGUI:
         
         # Configure grid weights
         minutes_frame.columnconfigure(0, weight=1)
-        minutes_frame.rowconfigure(3, weight=1)
+        minutes_frame.rowconfigure(4, weight=1)
         
         # Instructions
         instructions = ttk.Label(minutes_frame, 
@@ -753,9 +802,38 @@ class WhisperGUI:
             font=('TkDefaultFont', 10))
         instructions.grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
         
+        # Text input source frame
+        input_frame = ttk.LabelFrame(minutes_frame, text="Input Source", padding="10")
+        input_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        input_frame.columnconfigure(1, weight=1)
+        
+        # Text source selection
+        self.text_source_var = tk.StringVar(value="transcript")
+        self.text_source_var.trace('w', self.on_text_source_change)
+        
+        # Option 1: Use transcript from transcription
+        ttk.Radiobutton(input_frame, text="Use transcript from transcription tab", 
+                       variable=self.text_source_var, value="transcript").grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 5))
+        
+        # Option 2: Load text file
+        ttk.Radiobutton(input_frame, text="Load text file:", 
+                       variable=self.text_source_var, value="file").grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
+        
+        # Text file selection
+        text_file_frame = ttk.Frame(input_frame)
+        text_file_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+        text_file_frame.columnconfigure(1, weight=1)
+        
+        self.text_file_var = tk.StringVar()
+        text_file_entry = ttk.Entry(text_file_frame, textvariable=self.text_file_var, state='readonly')
+        text_file_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
+        
+        ttk.Button(text_file_frame, text="Browse Text File", 
+                  command=self.browse_text_file).grid(row=0, column=1)
+        
         # Generate button frame
         generate_frame = ttk.Frame(minutes_frame)
-        generate_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
+        generate_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
         
         self.generate_minutes_btn = ttk.Button(generate_frame, text="🤖 Generate Minutes with CIRCUIT", 
                                              command=self.generate_minutes, state=tk.DISABLED)
@@ -767,15 +845,15 @@ class WhisperGUI:
         
         # Status label for minutes generation (separate row)
         self.minutes_status = ttk.Label(minutes_frame, text="Ready to generate minutes", foreground='gray')
-        self.minutes_status.grid(row=2, column=0, sticky=tk.W, pady=(0, 10))
+        self.minutes_status.grid(row=3, column=0, sticky=tk.W, pady=(0, 10))
         
         # Minutes text area
         self.minutes_text = scrolledtext.ScrolledText(minutes_frame, wrap=tk.WORD, height=20)
-        self.minutes_text.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        self.minutes_text.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         
         # Save minutes button
         save_minutes_frame = ttk.Frame(minutes_frame)
-        save_minutes_frame.grid(row=4, column=0, sticky=(tk.W, tk.E))
+        save_minutes_frame.grid(row=5, column=0, sticky=(tk.W, tk.E))
         
         self.save_minutes_btn = ttk.Button(save_minutes_frame, text="💾 Save Minutes", 
                                           command=self.save_minutes, state=tk.DISABLED)
@@ -818,16 +896,16 @@ class WhisperGUI:
         
         # Model selection for CIRCUIT API
         ttk.Label(api_group, text="Model:").grid(row=3, column=0, sticky=tk.W, pady=(0, 5))
-        self.circuit_model_var = tk.StringVar(value="gpt-4o-mini")
+        self.circuit_model_var = tk.StringVar(value="gpt-4o-mini (Free Tier)")
         model_combo = ttk.Combobox(api_group, textvariable=self.circuit_model_var, 
                                   values=[
-                                      "gpt-4o",
-                                      "gpt-4o-mini", 
-                                      "gpt-4.1",
-                                      "o4-mini",
-                                      "o3",
-                                      "gemini-2.5-flash",
-                                      "gemini-2.5-pro"
+                                      "gpt-4o-mini (Free Tier)",
+                                      "gpt-4.1 (Free Tier)",
+                                      "gpt-4o (Premium Tier - Pay as you use)",
+                                      "o4-mini (Premium Tier - Pay as you use)",
+                                      "o3 (Premium Tier - Pay as you use)",
+                                      "gemini-2.5-flash (Premium Tier - Pay as you use)",
+                                      "gemini-2.5-pro (Premium Tier - Pay as you use)"
                                   ], state="readonly")
         model_combo.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=(0, 5))
         
@@ -850,20 +928,48 @@ class WhisperGUI:
         
         ttk.Label(prompt_group, text="Minutes Generation Template:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
         
-        self.minutes_prompt_var = tk.StringVar(value="""Please create professional meeting minutes from the following transcript. Include:
+        self.minutes_prompt_var = tk.StringVar(value="""Generate focused, actionable meeting minutes from the transcript below. Keep it concise and business-ready.
 
-1. **Meeting Summary**: Brief overview of the main topics discussed
-2. **Key Decisions**: Important decisions made during the meeting  
-3. **Action Items**: Tasks assigned with responsible parties (if mentioned)
-4. **Next Steps**: Planned follow-up actions or next meetings
+**Instructions:**
+- Generate in {language}
+- Focus on decisions and actions, not discussions
+- Use bullet points for clarity
+- Keep each section brief but complete
 
-Format the output in clear, professional language suitable for business documentation.
-Language: Generate the minutes in {language}.
+**Format:**
 
-Transcript:
+# Meeting Minutes
+
+## Summary
+[2-3 sentences describing the meeting purpose and main outcome]
+
+## Key Decisions
+• [Decision 1 - what was decided and why]
+• [Decision 2 - what was decided and why]
+• [Additional decisions...]
+
+## Action Items
+• **[Task]** - Assigned to: [Person] - Due: [Date/Timeline]
+• **[Task]** - Assigned to: [Person] - Due: [Date/Timeline]
+• **[Task]** - Assigned to: [Person] - Due: [Date/Timeline]
+
+## Important Issues
+• [Issue 1 - problem that needs attention]
+• [Issue 2 - concern raised during meeting]
+• [Additional issues...]
+
+## Next Steps
+• [Next meeting date/time if mentioned]
+• [Follow-up actions needed]
+• [Dependencies or blockers]
+
+---
+**Note:** If information is unclear or missing from the transcript, use "[Not specified]"
+
+**Transcript:**
 {transcript}""")
         
-        self.minutes_prompt_text = scrolledtext.ScrolledText(prompt_group, wrap=tk.WORD, height=12)
+        self.minutes_prompt_text = scrolledtext.ScrolledText(prompt_group, wrap=tk.WORD, height=15)
         self.minutes_prompt_text.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         self.minutes_prompt_text.insert('1.0', self.minutes_prompt_var.get())
         
@@ -896,6 +1002,34 @@ Transcript:
                 self.status_var.set(f"Selected: {os.path.basename(filename)} ({duration_str})")
             else:
                 self.status_var.set(f"Selected: {os.path.basename(filename)}")
+    
+    def browse_text_file(self):
+        """Open file browser to select text file for minutes generation"""
+        file_types = [
+            ("Text files", "*.txt *.text"),
+            ("All files", "*.*")
+        ]
+        
+        filename = filedialog.askopenfilename(
+            title="Select Text File",
+            filetypes=file_types
+        )
+        
+        if filename:
+            self.text_file_var.set(filename)
+            self.text_source_var.set("file")  # Auto-select file option
+            # Enable generate button if conditions are met
+            if self.can_generate_minutes():
+                self.generate_minutes_btn.config(state=tk.NORMAL)
+            self.minutes_status.config(text=f"Text file selected: {os.path.basename(filename)}")
+    
+    def on_text_source_change(self, *args):
+        """Called when text source radio button selection changes"""
+        # Update generate button state
+        if self.can_generate_minutes():
+            self.generate_minutes_btn.config(state=tk.NORMAL)
+        else:
+            self.generate_minutes_btn.config(state=tk.DISABLED)
     
     def get_audio_duration(self, file_path):
         """Get audio file duration in seconds using ffprobe"""
@@ -1056,6 +1190,19 @@ Transcript:
             self.process_manager._transcribing = True
             print("Debug: Started transcription - ffmpeg cleanup disabled")
             
+            # Strengthen the instance lock during transcription to prevent interference
+            if hasattr(self, 'instance_lock'):
+                # Force lock refresh to prevent timeout during long operations
+                try:
+                    # Write a fresh timestamp to lock file to indicate active processing
+                    if self.instance_lock.lock_file_handle:
+                        self.instance_lock.lock_file_handle.seek(0)
+                        self.instance_lock.lock_file_handle.write(f"{os.getpid()}\n{time.time()}\nMLXWhisperGUI-TRANSCRIBING")
+                        self.instance_lock.lock_file_handle.flush()
+                        self.instance_lock.lock_file_handle.truncate()
+                except Exception as e:
+                    print(f"Debug: Lock refresh warning: {e}")
+            
             model_name = self.model_var.get()
             language = self.language_var.get() if self.language_var.get() != "auto" else None
             
@@ -1155,6 +1302,17 @@ Transcript:
             # Re-enable ffmpeg cleanup and clean up any remaining processes
             self.process_manager._transcribing = False
             print("Debug: Transcription finished - re-enabling ffmpeg cleanup")
+            
+            # Reset lock file to normal state
+            if hasattr(self, 'instance_lock') and self.instance_lock.lock_file_handle:
+                try:
+                    self.instance_lock.lock_file_handle.seek(0)
+                    self.instance_lock.lock_file_handle.write(f"{os.getpid()}\n{time.time()}\nMLXWhisperGUI")
+                    self.instance_lock.lock_file_handle.flush()
+                    self.instance_lock.lock_file_handle.truncate()
+                except Exception as e:
+                    print(f"Debug: Lock reset warning: {e}")
+            
             self.process_manager.kill_ffmpeg_processes(force=True)
             
             # Re-enable UI
@@ -1192,9 +1350,8 @@ Transcript:
         self.progress_bar.config(mode="determinate")
         self.progress_var.set(100)
         
-        # Enable meeting minutes button if transcript exists and CIRCUIT credentials are configured
-        if (hasattr(self, 'result_text') and self.result_text.get(1.0, tk.END).strip() and 
-            self.circuit_credentials_configured()):
+        # Enable meeting minutes button if conditions are met
+        if self.can_generate_minutes():
             self.generate_minutes_btn.config(state="normal")
         
         # Calculate actual processing time
@@ -1393,6 +1550,17 @@ Transcript:
         finally:
             # Reset transcription state and cleanup
             self.process_manager._transcribing = False
+            
+            # Reset lock file to normal state after batch processing
+            if hasattr(self, 'instance_lock') and self.instance_lock.lock_file_handle:
+                try:
+                    self.instance_lock.lock_file_handle.seek(0)
+                    self.instance_lock.lock_file_handle.write(f"{os.getpid()}\n{time.time()}\nMLXWhisperGUI")
+                    self.instance_lock.lock_file_handle.flush()
+                    self.instance_lock.lock_file_handle.truncate()
+                except Exception as e:
+                    print(f"Debug: Batch lock reset warning: {e}")
+            
             self.process_manager.kill_ffmpeg_processes(force=True)
             # Re-enable UI
             self.root.after(0, self.batch_processing_complete)
@@ -1487,6 +1655,45 @@ Transcript:
         # Start monitoring after a delay
         self.root.after(5000, monitor_processes)  # Start after 5 seconds
 
+    def _cleanup_stale_pid_files(self):
+        """Clean up any stale PID files from previous instances"""
+        try:
+            if platform.system() == "Darwin":
+                pid_dir = os.path.expanduser("~/Library/Application Support/MLXWhisperGUI")
+            else:
+                pid_dir = tempfile.gettempdir()
+            
+            pid_file = os.path.join(pid_dir, "MLXWhisperGUI.pid")
+            current_pid = os.getpid()
+            
+            if os.path.exists(pid_file):
+                try:
+                    with open(pid_file, 'r') as f:
+                        content = f.read().strip()
+                        lines = content.split('\n')
+                        stored_pid = int(lines[0])
+                    
+                    # If PID file contains our current PID, it's stale
+                    if stored_pid == current_pid:
+                        os.remove(pid_file)
+                        print(f"Debug: Removed stale self-referencing PID file")
+                    else:
+                        # Check if stored process is actually running
+                        try:
+                            os.kill(stored_pid, 0)
+                            # Process exists - don't remove PID file
+                            print(f"Debug: PID file contains active process {stored_pid}")
+                        except (OSError, ProcessLookupError):
+                            # Process is dead - remove stale PID file
+                            os.remove(pid_file)
+                            print(f"Debug: Removed stale PID file for dead process {stored_pid}")
+                except (ValueError, IOError, IndexError):
+                    # Invalid PID file - remove it
+                    os.remove(pid_file)
+                    print("Debug: Removed invalid PID file")
+        except Exception as e:
+            print(f"Debug: Exception during PID file cleanup: {e}")
+    
     def on_closing(self):
         """Handle window closing event"""
         print("Debug: Application closing, performing quick cleanup")
@@ -1560,6 +1767,18 @@ Transcript:
                 self.client_secret_var.get().strip() and 
                 self.app_key_var.get().strip())
     
+    def can_generate_minutes(self):
+        """Check if minutes generation is available"""
+        if not self.circuit_credentials_configured():
+            return False
+        
+        # Check if we have text from transcript or file
+        if self.text_source_var.get() == "file":
+            return bool(self.text_file_var.get())
+        else:
+            return (hasattr(self, 'result_text') and 
+                   bool(self.result_text.get(1.0, tk.END).strip()))
+    
     def test_circuit_connection(self):
         """Test CIRCUIT API connection"""
         if not self.circuit_credentials_configured():
@@ -1610,15 +1829,34 @@ Transcript:
             return None
     
     def generate_minutes(self):
-        """Generate meeting minutes from transcript using CIRCUIT API"""
-        if not hasattr(self, 'result_text'):
-            messagebox.showerror("Error", "No transcript available for minutes generation")
-            return
+        """Generate meeting minutes from transcript or text file using CIRCUIT API"""
+        # Get text source based on selection
+        if self.text_source_var.get() == "file":
+            # Use text from file
+            text_file_path = self.text_file_var.get()
+            if not text_file_path:
+                messagebox.showerror("Error", "No text file selected")
+                return
             
-        transcript = self.result_text.get(1.0, tk.END).strip()
-        if not transcript:
-            messagebox.showerror("Error", "Transcript is empty")
-            return
+            try:
+                with open(text_file_path, 'r', encoding='utf-8') as f:
+                    transcript = f.read().strip()
+                if not transcript:
+                    messagebox.showerror("Error", "Text file is empty")
+                    return
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to read text file: {str(e)}")
+                return
+        else:
+            # Use transcript from transcription tab
+            if not hasattr(self, 'result_text'):
+                messagebox.showerror("Error", "No transcript available for minutes generation")
+                return
+                
+            transcript = self.result_text.get(1.0, tk.END).strip()
+            if not transcript:
+                messagebox.showerror("Error", "Transcript is empty")
+                return
         
         # Check if CIRCUIT credentials are configured
         if not self.circuit_credentials_configured():
@@ -1686,7 +1924,9 @@ Transcript:
         """Call CIRCUIT API to generate meeting minutes"""
         import requests
         
-        model = self.circuit_model_var.get()
+        # Extract actual model name from display string (remove tier info)
+        model_display = self.circuit_model_var.get()
+        model = model_display.split(' (')[0]  # Extract base model name
         app_key = self.app_key_var.get().strip()
         
         url = f"https://chat-ai.cisco.com/openai/deployments/{model}/chat/completions"
@@ -1829,7 +2069,18 @@ Transcript:
                 self.client_id_var.set(settings.get("client_id", ""))
                 self.client_secret_var.set(settings.get("client_secret", ""))
                 self.app_key_var.set(settings.get("app_key", ""))
-                self.circuit_model_var.set(settings.get("circuit_model", "gpt-4o-mini"))
+                
+                # Handle backward compatibility for model setting
+                saved_model = settings.get("circuit_model", "gpt-4o-mini")
+                # If saved model doesn't have tier info, add Free Tier for free models
+                if saved_model in ["gpt-4o-mini", "gpt-4.1"]:
+                    saved_model = f"{saved_model} (Free Tier)"
+                elif " (" not in saved_model and saved_model in ["gpt-4o", "o4-mini", "o3", "gemini-2.5-flash", "gemini-2.5-pro"]:
+                    saved_model = f"{saved_model} (Premium Tier - Pay as you use)"
+                elif saved_model == "gpt-4o-mini":  # Default case
+                    saved_model = "gpt-4o-mini (Free Tier)"
+                
+                self.circuit_model_var.set(saved_model)
                 self.minutes_language_var.set(settings.get("minutes_language", "Auto (from transcript)"))
                 
                 # Load minutes template
